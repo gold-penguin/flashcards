@@ -1,6 +1,6 @@
 // 오프라인 지원: 캐시를 먼저 보여 주고 백그라운드에서 최신 파일로 갱신한다(stale-while-revalidate).
 // 배포 후 변경 사항은 앱을 한 번 열었다 닫은 뒤 다음 실행부터 반영된다.
-const CACHE = 'flashcards-v4';
+const CACHE = 'flashcards-v5';
 const FONT_CACHE = 'flashcards-fonts';
 const ASSETS = [
   './',

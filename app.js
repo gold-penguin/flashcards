@@ -72,32 +72,56 @@ const store = {
 
 /* ───────────────────────── 저장소(IndexedDB) ───────────────────────── */
 
-const STORES = ['domains', 'categories', 'decks', 'cards'];
-const S = { domains: new Map(), categories: new Map(), decks: new Map(), cards: new Map() };
+// 메모리(S)에 올려 두는 저장소. 사진(media)은 용량이 커서 필요할 때만 DB에서 읽는다.
+// 'flashcards' DB(버전 1)는 같은 origin의 학습 트래커(/studytrack/)도 읽고 쓰므로 구조·버전을 바꾸지 않는다.
+// 새로 생긴 헷갈림 짝(pairs)과 사진(media)은 별도 DB 'flashcards-extra'에 둔다.
+const DBS = {
+  flashcards: { version: 1, stores: ['domains', 'categories', 'decks', 'cards'] },
+  'flashcards-extra': { version: 1, stores: ['pairs', 'media'] },
+};
+const STORES = ['domains', 'categories', 'decks', 'cards', 'pairs'];
+const S = { domains: new Map(), categories: new Map(), decks: new Map(), cards: new Map(), pairs: new Map() };
 
 const DB = {
-  db: null,
+  dbs: {},
+  dbOf(store) { return this.dbs[Object.keys(DBS).find(n => DBS[n].stores.includes(store))]; },
   open() {
-    return new Promise((res, rej) => {
-      const r = indexedDB.open('flashcards', 1);
+    return Promise.all(Object.entries(DBS).map(([name, def]) => new Promise((res, rej) => {
+      const r = indexedDB.open(name, def.version);
       r.onupgradeneeded = () => {
-        for (const s of STORES) if (!r.result.objectStoreNames.contains(s)) r.result.createObjectStore(s, { keyPath: 'id' });
+        for (const s of def.stores) if (!r.result.objectStoreNames.contains(s)) r.result.createObjectStore(s, { keyPath: 'id' });
       };
-      r.onsuccess = () => { this.db = r.result; res(); };
+      r.onsuccess = () => {
+        this.dbs[name] = r.result;
+        // 다른 탭이 새 버전을 열려고 하면 막지 않도록 닫아 준다
+        r.result.onversionchange = () => r.result.close();
+        res();
+      };
       r.onerror = () => rej(r.error);
-    });
+      r.onblocked = () => rej(new Error('다른 탭에서 앱이 열려 있어 저장소를 열 수 없습니다'));
+    })));
   },
-  all(name) {
+  req(store, fn) {
     return new Promise((res, rej) => {
-      const q = this.db.transaction(name).objectStore(name).getAll();
+      const q = fn(this.dbOf(store).transaction(store).objectStore(store));
       q.onsuccess = () => res(q.result);
       q.onerror = () => rej(q.error);
     });
   },
+  all(store) { return this.req(store, os => os.getAll()); },
+  get(store, id) { return this.req(store, os => os.get(id)); },
+  count(store) { return this.req(store, os => os.count()); },
+  /** ops를 DB별 트랜잭션 하나씩으로 나눠 쓴다 */
   write(ops) {
-    return new Promise((res, rej) => {
-      const t = this.db.transaction([...new Set(ops.map(o => o.store))], 'readwrite');
-      for (const o of ops) {
+    const byDb = new Map();
+    for (const o of ops) {
+      const db = this.dbOf(o.store);
+      if (!byDb.has(db)) byDb.set(db, []);
+      byDb.get(db).push(o);
+    }
+    return Promise.all([...byDb].map(([db, list]) => new Promise((res, rej) => {
+      const t = db.transaction([...new Set(list.map(o => o.store))], 'readwrite');
+      for (const o of list) {
         const os = t.objectStore(o.store);
         if (o.clear) os.clear();
         (o.put || []).forEach(v => os.put(v));
@@ -106,28 +130,99 @@ const DB = {
       t.oncomplete = () => res();
       t.onerror = () => rej(t.error);
       t.onabort = () => rej(t.error || new Error('저장이 취소되었습니다'));
-    });
+    })));
   },
 };
 
+let mediaCount = 0; // 백업 때 사진이 있는지 바로 알기 위해 개수만 들고 있는다
 async function loadAll() {
   for (const s of STORES) {
     S[s].clear();
     for (const o of await DB.all(s)) S[s].set(o.id, o);
   }
+  mediaCount = await DB.count('media').catch(() => 0);
 }
 
-/** 메모리 상태와 DB를 함께 갱신한다. put/del: { storeName: [...] } */
+/** 메모리 상태와 DB를 함께 갱신한다. put/del: { storeName: [...] }
+    카드를 지우면 그 카드의 사진과 헷갈림 짝도 함께 지운다. */
 async function commit(put = {}, del = {}) {
+  if (del.cards && del.cards.length) {
+    const gone = new Set(del.cards);
+    const media = [];
+    for (const id of gone) { const c = S.cards.get(id); if (c) media.push(...mediaIdsOf(c)); }
+    del = {
+      ...del,
+      media: [...(del.media || []), ...media],
+      pairs: [...(del.pairs || []), ...[...S.pairs.values()].filter(p => gone.has(p.a) || gone.has(p.b)).map(p => p.id)],
+    };
+  }
   const ops = [];
-  for (const [s, arr] of Object.entries(put)) if (arr && arr.length) { arr.forEach(o => S[s].set(o.id, o)); ops.push({ store: s, put: arr }); }
-  for (const [s, ids] of Object.entries(del)) if (ids && ids.length) { ids.forEach(id => S[s].delete(id)); ops.push({ store: s, del: ids }); }
+  for (const [s, arr] of Object.entries(put)) if (arr && arr.length) {
+    if (S[s]) arr.forEach(o => S[s].set(o.id, o));
+    if (s === 'media') mediaCount += arr.length;
+    ops.push({ store: s, put: arr });
+  }
+  for (const [s, ids] of Object.entries(del)) if (ids && ids.length) {
+    if (S[s]) ids.forEach(id => S[s].delete(id));
+    if (s === 'media') { ids.forEach(forgetMediaUrl); mediaCount = Math.max(0, mediaCount - ids.length); }
+    ops.push({ store: s, del: ids });
+  }
   if (!ops.length) return;
   try { await DB.write(ops); } catch (e) { toast('저장 실패: ' + e.message); throw e; }
 }
 
 function requestPersist() {
   try { navigator.storage && navigator.storage.persist && navigator.storage.persist(); } catch { /* 무시 */ }
+}
+
+/* ───────────────────────── 사진 ───────────────────────── */
+// 카드 필드에 { l: '사진', v: '설명(선택)', img: mediaId }로 붙인다. 원본은 긴 변 1400px JPEG로 줄여 저장.
+
+const mediaUrls = new Map();
+const mediaIdsOf = c => [...(c.front || []), ...(c.back || [])].filter(f => f.img).map(f => f.img);
+function forgetMediaUrl(id) {
+  const u = mediaUrls.get(id);
+  if (u) { URL.revokeObjectURL(u); mediaUrls.delete(id); }
+}
+async function mediaUrl(id) {
+  if (mediaUrls.has(id)) return mediaUrls.get(id);
+  const m = await DB.get('media', id);
+  if (!m) return '';
+  const u = URL.createObjectURL(m.blob);
+  mediaUrls.set(id, u);
+  return u;
+}
+/** 화면에 그려진 <img data-media>에 실제 사진을 채운다 */
+function hydrateMedia(root = document) {
+  root.querySelectorAll('img[data-media]:not([src])').forEach(async img => {
+    const u = await mediaUrl(img.dataset.media);
+    if (u) img.src = u;
+    else { img.alt = '사진을 찾을 수 없어요'; img.classList.add('missing'); }
+  });
+}
+function loadImageEl(file) {
+  return new Promise((res, rej) => {
+    const u = URL.createObjectURL(file);
+    const im = new Image();
+    im.onload = () => { URL.revokeObjectURL(u); res(im); };
+    im.onerror = () => { URL.revokeObjectURL(u); rej(new Error('이미지를 읽을 수 없습니다')); };
+    im.src = u;
+  });
+}
+async function saveImage(file) {
+  const im = await loadImageEl(file);
+  const MAX = 1400;
+  const k = Math.min(1, MAX / Math.max(im.naturalWidth, im.naturalHeight));
+  const cv = document.createElement('canvas');
+  cv.width = Math.round(im.naturalWidth * k);
+  cv.height = Math.round(im.naturalHeight * k);
+  cv.getContext('2d').drawImage(im, 0, 0, cv.width, cv.height);
+  const blob = await new Promise(r => cv.toBlob(r, 'image/jpeg', 0.82));
+  if (!blob) throw new Error('이미지를 변환할 수 없습니다');
+  const id = uid();
+  await commit({ media: [{ id, blob, created: Date.now() }] });
+  requestPersist();
+  return id;
 }
 
 /* ───────────────────────── 구조 조회 ───────────────────────── */
@@ -156,6 +251,7 @@ function scopeName(scope) {
   if (t === 'deck') return S.decks.get(id)?.name ?? '';
   if (t === 'cat') return S.categories.get(id)?.name ?? '';
   if (t === 'dom') return S.domains.get(id)?.name ?? '';
+  if (t === 'pairs') return '헷갈림 짝';
   return '전체';
 }
 function catPath(catId) {
@@ -318,14 +414,15 @@ function studyDays() {
 
 /* ───────────────────────── 모달 ───────────────────────── */
 
-function modal({ title = '', body = '', actions = [], sheet = false }) {
+// 동작 버튼은 data-mi로 구분한다(본문 요소의 data-* 속성과 겹치지 않게). onOpen(el)로 본문에 동작을 붙일 수 있다.
+function modal({ title = '', body = '', actions = [], sheet = false, onOpen = null }) {
   return new Promise(resolve => {
     const wrap = document.createElement('div');
     wrap.className = 'overlay' + (sheet ? ' sheet' : '');
     wrap.innerHTML = `<div class="modal" role="dialog" aria-modal="true">
       ${title ? `<h2>${esc(title)}</h2>` : ''}
       <div class="modal-body">${body}</div>
-      <div class="modal-actions">${actions.map((a, i) => `<button type="button" class="btn ${a.cls || ''}" data-i="${i}">${esc(a.label)}</button>`).join('')}</div>
+      <div class="modal-actions">${actions.map((a, i) => `<button type="button" class="btn ${a.cls || ''}" data-mi="${i}">${esc(a.label)}</button>`).join('')}</div>
     </div>`;
     const close = value => {
       wrap.remove();
@@ -341,12 +438,14 @@ function modal({ title = '', body = '', actions = [], sheet = false }) {
     };
     wrap.addEventListener('click', e => {
       if (e.target === wrap) return close(null);
-      const b = e.target.closest('[data-i]');
-      if (b) close(actions[+b.dataset.i].value);
+      const b = e.target.closest('[data-mi]');
+      if (b) close(actions[+b.dataset.mi].value);
     });
     document.addEventListener('keydown', onKey, true);
     document.body.appendChild(wrap);
-    const f = wrap.querySelector('input:not([type=checkbox]), textarea');
+    hydrateMedia(wrap);
+    if (onOpen) onOpen(wrap);
+    const f = wrap.querySelector('input:not([type=checkbox]):not([type=file]), textarea');
     if (f) { f.focus(); if (f.select) f.select(); }
   });
 }
@@ -405,10 +504,12 @@ window.addEventListener('popstate', e => {
 
 function render() {
   clearTimeout(waitTimer);
-  const views = { home: viewHome, deck: viewDeck, study: viewStudy, browse: viewBrowse, import: viewImport };
+  const views = { home: viewHome, deck: viewDeck, study: viewStudy, browse: viewBrowse, import: viewImport, pairs: viewPairs, search: viewSearch };
   app.className = 'view-' + V.name;
   app.innerHTML = (views[V.name] || viewHome)();
   if (V.name === 'study') bindSwipe();
+  hydrateMedia(app);
+  updateFocusPill();
 }
 
 function bar(title, right = '') {
@@ -460,11 +561,14 @@ function viewHome() {
         </div>
       </section>
       ${weakHtml('all')}
+      ${pairsHtml()}
       ${doms.map(d => domainHtml(d, m)).join('')}`;
   }
 
   return `<header class="bar">
       <h1>암기장</h1>
+      ${focusT ? focusPill() : ''}
+      <button class="icon-btn" data-act="search" aria-label="전체 검색">🔍</button>
       <button class="btn small primary" data-act="import">＋ 가져오기</button>
     </header>
     <main>
@@ -633,8 +737,10 @@ function pickNext() {
 
 function fieldsHtml(fields, deck) {
   if (!fields || !fields.length) return '<div class="muted">(비어 있음)</div>';
-  const labels = deck.showLabels !== false && fields.length > 1;
-  return fields.map(f => `<div class="fld">${labels ? `<div class="flabel">${esc(f.l)}</div>` : ''}<div class="fval">${esc(f.v)}</div></div>`).join('');
+  const labels = deck.showLabels !== false && fields.filter(f => !f.img).length > 1;
+  return fields.map(f => f.img
+    ? `<div class="fld"><img class="card-img" data-media="${esc(f.img)}" alt="카드 사진">${f.v ? `<div class="fval cap">${esc(f.v)}</div>` : ''}</div>`
+    : `<div class="fld">${labels ? `<div class="flabel">${esc(f.l)}</div>` : ''}<div class="fval">${esc(f.v)}</div></div>`).join('');
 }
 
 function viewStudy() {
@@ -644,7 +750,7 @@ function viewStudy() {
   const right = `${s.practice ? '' : `<button class="icon-btn" data-act="undo" ${s.undo ? '' : 'disabled'} aria-label="되돌리기">↶</button>`}
     ${c ? `<button class="icon-btn" data-act="ask-claude" aria-label="Claude에게 묻기">💬</button>
     <button class="icon-btn" data-act="menu-card" aria-label="카드 메뉴">⋯</button>` : ''}`;
-  const head = `${bar(scopeName(s.scope), right)}`;
+  const head = `${bar(scopeName(s.scope), focusPill() + right)}`;
 
   if (!c) {
     let msg;
@@ -724,6 +830,7 @@ async function answer(r) {
     } else if (c.state === 'review') s.revSinceNew++;
     s.done++;
     markStudied();
+    focusCount(r >= 2);
     await commit(put);
     pickNext();
     render();
@@ -750,6 +857,7 @@ function answerPractice(ok) {
   if (ok) s.done++;
   else s.queue.splice(Math.min(3, s.queue.length), 0, id); // 몇 장 뒤에 다시 나오게
   markStudied();
+  focusCount(ok);
   pickNext();
   render();
 }
@@ -763,11 +871,15 @@ function shuffle(a) {
   return a;
 }
 const sideOf = (card, side) => spoken(side === 'front' ? card.front : card.back);
-const sideText = (card, side) => sideOf(card, side).map(f => f.v).join(' / ');
+const sideText = (card, side) => sideOf(card, side).map(f => f.v).filter(Boolean).join(' / ');
 const quizSides = dir => (dir === 'bf' ? ['back', 'front'] : ['front', 'back']);
 
 function quizQuestions(scope, dir) {
   const [qs, as] = quizSides(dir);
+  if (scope === 'pairs') {
+    const ids = [...new Set(pairList().flatMap(p => [p.a, p.b]))].filter(id => sideText(S.cards.get(id), qs) && sideText(S.cards.get(id), as));
+    return shuffle(ids).slice(0, QUIZ_SIZE);
+  }
   const ids = new Set(scopeDecks(scope));
   const pool = [...S.cards.values()].filter(c => ids.has(c.deckId) && !c.suspended && sideText(c, qs) && sideText(c, as));
   return shuffle(pool).slice(0, QUIZ_SIZE).map(c => c.id);
@@ -779,6 +891,14 @@ function quizOptions(card) {
   const scopeIds = new Set(scopeDecks(study.scope));
   const seen = new Set([answer]);
   const wrong = [];
+  // 짝 퀴즈: 헷갈렸던 상대 카드의 답을 먼저 보기로 넣는다
+  if (baseScope(study.scope) === 'pairs') {
+    for (const p of pairList()) {
+      const other = p.a === card.id ? p.b : p.b === card.id ? p.a : null;
+      const t = other && sideText(S.cards.get(other), as);
+      if (t && !seen.has(t) && wrong.length < 3) { seen.add(t); wrong.push({ text: t, id: other }); }
+    }
+  }
   // 같은 암기장의 보기를 먼저, 모자라면 같은 범위의 다른 암기장에서 채운다
   for (const sameDeck of [true, false]) {
     const cands = shuffle([...S.cards.values()].filter(c =>
@@ -786,10 +906,11 @@ function quizOptions(card) {
     for (const c of cands) {
       if (wrong.length >= 3) break;
       const t = sideText(c, as);
-      if (t && !seen.has(t)) { seen.add(t); wrong.push(t); }
+      if (t && !seen.has(t)) { seen.add(t); wrong.push({ text: t, id: c.id }); }
     }
   }
-  return shuffle([{ text: answer, correct: true }, ...wrong.map(text => ({ text, correct: false }))]);
+  // id: 오답 보기를 가져온 카드 → 헷갈림 짝 기록에 쓴다
+  return shuffle([{ text: answer, correct: true, id: card.id }, ...wrong.map(w => ({ ...w, correct: false }))]);
 }
 
 function pickQuiz(i) {
@@ -798,8 +919,9 @@ function pickQuiz(i) {
   s.picked = i;
   const ok = s.options[i].correct;
   if (ok) s.right++;
-  else s.wrong.push(s.card.id);
+  else { s.wrong.push(s.card.id); recordPair(s.card.id, s.options[i].id); }
   markStudied();
+  focusCount(ok);
   render();
   if (ok) {
     const id = s.card.id;
@@ -832,7 +954,7 @@ function toggleQuizDir() {
 
 function viewQuiz() {
   const s = study, c = s.card;
-  const head = bar(scopeName(s.scope), c ? `<button class="icon-btn" data-act="ask-claude" aria-label="Claude에게 묻기">💬</button>` : '');
+  const head = bar(scopeName(s.scope), focusPill() + (c ? `<button class="icon-btn" data-act="ask-claude" aria-label="Claude에게 묻기">💬</button>` : ''));
   const dirChip = `<button class="dir-chip" data-act="quiz-dir">${s.dir === 'fb' ? '앞면 → 뒷면' : '뒷면 → 앞면'} ⇄</button>`;
 
   if (!c) {
@@ -865,6 +987,7 @@ function viewQuiz() {
       <span class="n">${answered && o.correct ? '✓' : answered && i === s.picked ? '✕' : i + 1}</span><span class="t">${esc(o.text)}</span></button>`;
   }).join('');
   const missed = answered && !s.options[s.picked].correct;
+  const pairNote = missed ? `<p class="pair-note">🔀 헷갈림 노트에 기록했어요</p>` : '';
   return `${head}
   <main style="--tab:${dom ? domColor(dom) : 'var(--accent)'}">
     <div class="study-progress">
@@ -876,8 +999,246 @@ function viewQuiz() {
       <div class="inner"><div class="front">${fieldsHtml(sideOf(c, qs), deck)}</div></div>
     </div>
     <div class="quiz-options ${s.options.length < 4 ? 'few' : ''}">${opts}</div>
-    <div class="quiz-foot">${missed ? `<button class="btn primary block" data-act="quiz-next">다음 문제 →</button>` : ''}</div>
+    <div class="quiz-foot">${missed ? `${pairNote}<button class="btn primary block" data-act="quiz-next">다음 문제 →</button>` : ''}</div>
   </main>`;
+}
+
+/* ───────────────────────── 헷갈림 노트 ───────────────────────── */
+// 퀴즈에서 A의 답으로 B의 답을 고르면 (A, B)를 헷갈리는 짝으로 기록한다.
+
+const pairId = (a, b) => (a < b ? `${a}|${b}` : `${b}|${a}`);
+function recordPair(a, b) {
+  if (!a || !b || a === b || !S.cards.has(a) || !S.cards.has(b)) return;
+  const id = pairId(a, b);
+  const p = S.pairs.get(id);
+  commit({ pairs: [p ? { ...p, count: p.count + 1, last: Date.now() } : { id, a, b, count: 1, created: Date.now(), last: Date.now() }] });
+}
+function pairList() {
+  return [...S.pairs.values()].filter(p => S.cards.has(p.a) && S.cards.has(p.b))
+    .sort((x, y) => y.count - x.count || y.last - x.last);
+}
+function pairsHtml() {
+  const n = pairList().length;
+  if (!n) return '';
+  return `<button class="weak-card pairs-card" data-act="pairs">
+    <span class="wi">🔀</span>
+    <span class="wt"><b>헷갈리는 짝 ${n}개</b><small>퀴즈에서 헷갈린 카드끼리 나란히 비교해요</small></span>
+    <span class="go">›</span>
+  </button>`;
+}
+function pairSide(card) {
+  const deck = S.decks.get(card.deckId);
+  const img = [...card.front, ...card.back].find(f => f.img);
+  return `<div class="pside">
+    ${img ? `<img class="pimg" data-media="${esc(img.img)}" alt="">` : ''}
+    <div class="pf">${esc(sideText(card, 'front') || firstLine(card.front))}</div>
+    <div class="pb">${esc(sideText(card, 'back'))}</div>
+    <div class="pd">${esc(deck ? deck.name : '')}</div>
+  </div>`;
+}
+function viewPairs() {
+  const list = pairList();
+  const head = bar('🔀 헷갈림 노트', list.length ? `<button class="btn small" data-act="study" data-scope="${QUIZ}pairs">🎯 짝 퀴즈</button>` : '');
+  if (!list.length) return `${head}<main><div class="empty"><div style="font-size:52px">🔀</div><h2>아직 헷갈린 짝이 없어요</h2><p>객관식 퀴즈에서 틀리면 무엇과 헷갈렸는지 여기에 모아 둡니다.</p></div></main>`;
+  return `${head}<main>
+    <p class="muted" style="margin-top:0">나란히 비교해 보고, 확실히 구분되면 <b>이제 구분돼요</b>로 정리하세요.</p>
+    ${list.map(p => `<section class="pair">
+      <div class="pair-top"><span class="pc">${p.count}번 헷갈림</span></div>
+      <div class="pair-grid">${pairSide(S.cards.get(p.a))}<div class="vs">vs</div>${pairSide(S.cards.get(p.b))}</div>
+      <div class="pair-actions">
+        <button class="btn small" data-act="pair-ask" data-id="${esc(p.id)}">💬 차이 묻기</button>
+        <button class="btn small" data-act="pair-done" data-id="${esc(p.id)}">✓ 이제 구분돼요</button>
+      </div>
+    </section>`).join('')}
+  </main>`;
+}
+function askPair(id) {
+  const p = S.pairs.get(id);
+  if (!p) return;
+  const txt = c => {
+    const side = fields => spoken(fields).filter(f => f.v).map(f => (fields.length > 1 ? `${f.l}: ${f.v}` : f.v)).join('\n');
+    return `앞면: ${side(c.front)}\n뒷면: ${side(c.back) || '(비어 있음)'}`;
+  };
+  openClaude(`암기 공부 중 자주 헷갈리는 두 카드예요. 한국어로 답해 주세요.
+
+[카드 1]
+${txt(S.cards.get(p.a))}
+
+[카드 2]
+${txt(S.cards.get(p.b))}
+
+질문: 두 내용의 차이를 비교해서 설명하고, 앞으로 헷갈리지 않게 구분하는 요령을 알려 줘.`);
+}
+async function donePair(id) {
+  await commit({}, { pairs: [id] });
+  toast('정리했어요. 다시 헷갈리면 또 기록돼요');
+  render();
+}
+
+/* ───────────────────────── 집중 타이머 ───────────────────────── */
+// 집중 N분 + 휴식. 집중 동안의 학습량·정답률을 모아 끝나면 요약해 준다. 앱을 닫았다 열어도 이어진다.
+
+let focusT = store.get('focus', null);
+let audioCtx = null;
+const fmtClock = ms => { const t = Math.max(0, Math.ceil(ms / 1000)); return `${Math.floor(t / 60)}:${String(t % 60).padStart(2, '0')}`; };
+const focusLeft = () => (focusT ? (focusT.paused ? focusT.remain : focusT.endsAt - Date.now()) : 0);
+const saveFocus = () => store.set('focus', focusT);
+
+function audioInit() {
+  try {
+    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+  } catch { /* 소리 없이 진행 */ }
+}
+function beep() {
+  try { navigator.vibrate && navigator.vibrate([200, 100, 200]); } catch { /* 무시 */ }
+  if (!audioCtx) return;
+  const t = audioCtx.currentTime;
+  [0, 0.28, 0.56].forEach(d => {
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.frequency.value = 880;
+    g.gain.setValueAtTime(0.0001, t + d);
+    g.gain.exponentialRampToValueAtTime(0.25, t + d + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + d + 0.22);
+    o.connect(g).connect(audioCtx.destination);
+    o.start(t + d);
+    o.stop(t + d + 0.24);
+  });
+}
+
+function startFocus(mins) {
+  audioInit();
+  focusT = { mode: 'focus', mins, brk: mins >= 50 ? 10 : 5, endsAt: Date.now() + mins * MIN, paused: false, remain: 0, n: 0, ok: 0 };
+  saveFocus();
+  toast(`⏱ ${mins}분 집중 시작!`);
+  render();
+}
+function focusCount(ok) {
+  if (!focusT || focusT.mode !== 'focus') return;
+  focusT.n++;
+  if (ok) focusT.ok++;
+  saveFocus();
+}
+function focusPill() {
+  if (!focusT) return `<button class="icon-btn" data-act="focus" aria-label="집중 타이머">⏱</button>`;
+  return `<button class="focus-pill ${focusT.mode} ${focusT.paused ? 'paused' : ''}" data-act="focus">${focusT.mode === 'focus' ? '🍅' : '☕'} <span>${fmtClock(focusLeft())}</span></button>`;
+}
+function updateFocusPill() {
+  document.querySelectorAll('.focus-pill span').forEach(el => { el.textContent = fmtClock(focusLeft()); });
+}
+
+let focusBusy = false;
+async function focusTick() {
+  updateFocusPill();
+  if (!focusT || focusT.paused || focusBusy || focusLeft() > 0) return;
+  focusBusy = true;
+  try {
+    beep();
+    if (focusT.mode === 'focus') {
+      const { mins, brk, n, ok } = focusT;
+      const pct = n ? Math.round((ok / n) * 100) : 0;
+      focusT = { ...focusT, mode: 'break', endsAt: Date.now() + brk * MIN };
+      saveFocus();
+      render();
+      const r = await modal({
+        title: `🍅 ${mins}분 집중 완료!`,
+        body: `<div class="focus-sum"><div><b>${n}</b><span>학습한 카드</span></div><div><b>${n ? pct + '%' : '–'}</b><span>정답률</span></div></div>
+          <p class="muted" style="text-align:center">${brk}분 쉬고 다시 해 볼까요?</p>`,
+        actions: [{ label: '타이머 끄기', value: 'stop' }, { label: '바로 계속', value: 'again' }, { label: `☕ ${brk}분 휴식`, value: 'break', cls: 'primary' }],
+      });
+      if (r.value === 'stop') { focusT = null; saveFocus(); }
+      else if (r.value === 'again') startFocus(mins);
+    } else {
+      const mins = focusT.mins;
+      focusT = null;
+      saveFocus();
+      render();
+      const r = await modal({
+        title: '☕ 휴식 끝!',
+        body: '<p class="muted" style="text-align:center">다시 집중해 볼까요?</p>',
+        actions: [{ label: '그만할래요', value: null }, { label: `🍅 ${mins}분 시작`, value: 'go', cls: 'primary' }],
+      });
+      if (r.value === 'go') startFocus(mins);
+    }
+    render();
+  } finally { focusBusy = false; }
+}
+setInterval(focusTick, 1000);
+
+async function focusMenu() {
+  if (!focusT) {
+    const m = await ui.menu('⏱ 집중 타이머', [15, 25, 50].map(x => ({ label: `${x}분 집중 + ${x >= 50 ? 10 : 5}분 휴식`, value: x })));
+    if (m) startFocus(m);
+    return;
+  }
+  const a = await ui.menu(`${focusT.mode === 'focus' ? '🍅 집중' : '☕ 휴식'} 중 · ${fmtClock(focusLeft())} 남음`, [
+    { label: focusT.paused ? '▶ 다시 시작' : '❚❚ 일시정지', value: 'pause' },
+    ...(focusT.mode === 'focus' ? [{ label: '지금 끝내고 결과 보기', value: 'end' }] : [{ label: '휴식 건너뛰기', value: 'end' }]),
+    { label: '타이머 끄기', value: 'stop', danger: true },
+  ]);
+  if (!a || !focusT) return;
+  if (a === 'pause') {
+    if (focusT.paused) focusT = { ...focusT, paused: false, endsAt: Date.now() + focusT.remain };
+    else focusT = { ...focusT, paused: true, remain: focusLeft() };
+  } else if (a === 'end') focusT = { ...focusT, paused: false, endsAt: Date.now() };
+  else if (a === 'stop') focusT = null;
+  saveFocus();
+  render();
+}
+
+/* ───────────────────────── 전체 검색 ───────────────────────── */
+// 모든 암기장의 앞면·뒷면·메모를 찾는다. 'ㅅㄱ'처럼 초성만 입력해도 된다.
+
+const CHO = 'ㄱㄲㄴㄷㄸㄹㅁㅂㅃㅅㅆㅇㅈㅉㅊㅋㅌㅍㅎ';
+const choOf = s => s.replace(/[가-힣]/g, ch => CHO[Math.floor((ch.charCodeAt(0) - 0xAC00) / 588)]).replace(/\s+/g, '');
+const isCho = q => /^[ㄱ-ㅎ\s]+$/.test(q);
+
+function highlight(text, q) {
+  if (!q || isCho(q)) return esc(text);
+  const i = text.toLowerCase().indexOf(q.toLowerCase());
+  if (i < 0) return esc(text);
+  return esc(text.slice(0, i)) + '<mark>' + esc(text.slice(i, i + q.length)) + '</mark>' + esc(text.slice(i + q.length));
+}
+/** 검색어가 들어 있는 줄을 골라 보여 준다 */
+function matchLine(fields, q) {
+  const lines = (fields || []).flatMap(f => (f.v || '').split('\n')).filter(Boolean);
+  if (!q || isCho(q)) return lines[0] || firstLine(fields);
+  return lines.find(l => l.toLowerCase().includes(q.toLowerCase())) || lines[0] || firstLine(fields);
+}
+
+function viewSearch() {
+  return `${bar('검색')}
+  <main>
+    <div class="search"><input type="search" id="gsearch" placeholder="모든 암기장에서 찾기 (초성도 돼요: ㅅㄱ)" value="${esc(V.q || '')}" autofocus enterkeyhint="search"></div>
+    <div id="gresults">${searchResults()}</div>
+  </main>`;
+}
+function searchResults() {
+  const q = (V.q || '').trim();
+  if (!q) return `<div class="empty" style="padding-top:24px"><div style="font-size:44px">🔍</div><p>앞면·뒷면·메모에서 찾아요.<br>한글은 초성만 입력해도 돼요. 예) <b>ㄱㅎㅅ</b> → 광합성</p></div>`;
+  const cho = isCho(q), ql = q.toLowerCase(), qc = q.replace(/\s+/g, '');
+  const hits = [];
+  for (const c of S.cards.values()) {
+    const text = cardText(c);
+    if (cho ? choOf(text).includes(qc) : text.toLowerCase().includes(ql)) hits.push(c);
+  }
+  hits.sort((a, b) => {
+    const fa = sideText(a, 'front').toLowerCase(), fb = sideText(b, 'front').toLowerCase();
+    return (fb.startsWith(ql) - fa.startsWith(ql)) || fa.localeCompare(fb, 'ko');
+  });
+  const LIMIT = 100;
+  return `<p class="muted">${hits.length}장 찾음${hits.length > LIMIT ? ` · 처음 ${LIMIT}장만 표시` : ''}</p>`
+    + hits.slice(0, LIMIT).map(c => {
+      const d = S.decks.get(c.deckId);
+      return `<div class="card-row search-row">
+        <button class="sr-main" data-act="edit-card" data-id="${c.id}">
+          <div class="sp">${esc(d ? `${catPath(d.catId)} › ${d.name}` : '')}</div>
+          <div class="cf">${highlight(matchLine(c.front, q), q)}</div>
+          <div class="cb">${highlight(matchLine(c.back, q), q) || '&nbsp;'}</div>
+        </button>
+        <button class="sr-go" data-act="open-deck" data-id="${c.deckId}" aria-label="암기장 열기">›</button>
+      </div>`;
+    }).join('');
 }
 
 /* ───────────────────────── 약점 카드 ───────────────────────── */
@@ -1059,7 +1420,11 @@ async function setExam(deckId) {
 
 const STATE_LABEL = { new: '새 카드', learning: '학습 중', relearning: '재학습', review: '복습' };
 const cardText = c => [...c.front, ...c.back].map(f => f.v).join(' ');
-const firstLine = fields => (fields && fields.length ? fields[0].v.split('\n')[0] : '');
+const firstLine = fields => {
+  const t = (fields || []).find(f => f.v);
+  if (t) return t.v.split('\n')[0];
+  return (fields || []).some(f => f.img) ? '📷 사진' : '';
+};
 
 function viewBrowse() {
   const d = S.decks.get(V.id);
@@ -1088,31 +1453,79 @@ function browseList() {
     + (hits.length > LIMIT ? `<p class="muted">처음 ${LIMIT}장만 표시합니다. 검색으로 범위를 좁혀 보세요.</p>` : '');
 }
 
-/** 카드 편집 모달. 결과: 'saved' | 'deleted' | null */
+/** 카드 편집 모달(글자 + 사진). 결과: 'saved' | 'deleted' | null */
 async function editCard(card, isNew = false) {
-  const side = (fields, name, fallback) => {
-    const list = fields.length ? fields : [{ l: fallback, v: '' }];
-    return `<div class="side-label">${name}</div>` + list.map((f, i) =>
-      `<label class="field"><span>${esc(f.l)}</span><textarea data-side="${name === '앞면' ? 'front' : 'back'}" data-i="${i}" data-l="${esc(f.l)}">${esc(f.v)}</textarea></label>`).join('');
+  const imgs = { front: card.front.filter(f => f.img), back: card.back.filter(f => f.img) };
+  const added = [], removed = [];
+  const thumbs = s => imgs[s].map((f, k) =>
+    `<div class="thumb"><img data-media="${esc(f.img)}" alt=""><button type="button" class="img-del" data-side="${s}" data-k="${k}" aria-label="사진 삭제">✕</button></div>`).join('');
+  const side = (fields, s, name) => {
+    const texts = fields.filter(f => !f.img);
+    const list = texts.length ? texts : [{ l: name, v: '' }];
+    return `<div class="side-label">${name}</div>` + list.map(f =>
+      `<label class="field"><span>${esc(f.l)}</span><textarea data-side="${s}" data-l="${esc(f.l)}">${esc(f.v)}</textarea></label>`).join('')
+      + `<div class="img-row"><div class="thumbs" data-thumbs="${s}">${thumbs(s)}</div>
+          <label class="btn small img-add">📷 사진<input type="file" accept="image/*" data-img-side="${s}" hidden></label></div>`;
   };
-  const body = side(card.front, '앞면', '앞면') + side(card.back, '뒷면', '뒷면')
+  const body = side(card.front, 'front', '앞면') + side(card.back, 'back', '뒷면')
     + (isNew ? '' : `<label class="check"><input type="checkbox" id="m-susp" ${card.suspended ? 'checked' : ''}> 일시중지(학습에서 제외)</label>
        <label class="check"><input type="checkbox" id="m-reset"> 학습 기록 초기화(새 카드로)</label>`);
   const actions = isNew
     ? [{ label: '취소', value: null }, { label: '추가', value: 'save', cls: 'primary' }]
     : [{ label: '삭제', value: 'delete', cls: 'danger left' }, { label: '취소', value: null }, { label: '저장', value: 'save', cls: 'primary' }];
-  const r = await modal({ title: isNew ? '카드 추가' : '카드 편집', body, actions });
-  if (!r.value) return null;
+  let closed = false, pending = 0;
+  const onOpen = el => {
+    const redraw = s => { el.querySelector(`[data-thumbs="${s}"]`).innerHTML = thumbs(s); hydrateMedia(el); };
+    // 사진을 줄여 저장하는 동안에는 저장 버튼을 막아 사진이 빠진 채 저장되지 않게 한다
+    const busy = on => {
+      const ok = el.querySelector('.modal-actions .btn.primary');
+      if (ok) { ok.disabled = on; ok.textContent = on ? '사진 처리 중…' : (isNew ? '추가' : '저장'); }
+    };
+    el.addEventListener('change', async e => {
+      const inp = e.target.closest('input[data-img-side]');
+      if (!inp || !inp.files[0]) return;
+      const s = inp.dataset.imgSide;
+      const file = inp.files[0];
+      inp.value = '';
+      busy(true);
+      pending++;
+      try {
+        const id = await saveImage(file);
+        if (closed) { await commit({}, { media: [id] }); return; } // 그사이 창을 닫았으면 버린다
+        added.push(id);
+        imgs[s].push({ l: '사진', v: '', img: id });
+        redraw(s);
+      } catch (err) { toast(err.message); }
+      finally { if (--pending === 0 && !closed) busy(false); }
+    });
+    el.addEventListener('click', e => {
+      const b = e.target.closest('.img-del');
+      if (!b) return;
+      const s = b.dataset.side;
+      const [f] = imgs[s].splice(+b.dataset.k, 1);
+      if (f) removed.push(f.img);
+      redraw(s);
+    });
+  };
+  const r = await modal({ title: isNew ? '카드 추가' : '카드 편집', body, actions, onOpen });
+  closed = true;
+  const dropNew = () => commit({}, { media: added.filter(id => !mediaIdsOf(S.cards.get(card.id) || { front: [], back: [] }).includes(id)) });
+  if (!r.value) { await dropNew(); return null; }
 
   if (r.value === 'delete') {
-    if (!(await ui.confirm('카드 삭제', '이 카드를 삭제할까요?', '삭제', true))) return null;
+    if (!(await ui.confirm('카드 삭제', '이 카드를 삭제할까요?', '삭제', true))) { await dropNew(); return null; }
+    await dropNew();
     await commit({}, { cards: [card.id] });
     return 'deleted';
   }
   const read = s => [...r.el.querySelectorAll(`textarea[data-side="${s}"]`)]
-    .map(t => ({ l: t.dataset.l, v: t.value.trim() })).filter(f => f.v);
+    .map(t => ({ l: t.dataset.l, v: t.value.trim() })).filter(f => f.v).concat(imgs[s]);
   const front = read('front'), backF = read('back');
-  if (!front.length) { toast('앞면이 비어 있어 저장하지 않았습니다'); return null; }
+  if (!front.length) { await dropNew(); toast('앞면이 비어 있어 저장하지 않았습니다'); return null; }
+  // 지운 사진 중 새로 추가했던 것 포함해 실제로 더 이상 쓰지 않는 것만 정리
+  const keep = new Set([...front, ...backF].filter(f => f.img).map(f => f.img));
+  const orphan = [...removed].filter(id => !keep.has(id));
+  if (orphan.length) await commit({}, { media: orphan });
   let n = { ...card, front, back: backF };
   if (!isNew) {
     n.suspended = r.el.querySelector('#m-susp').checked;
@@ -1370,6 +1783,9 @@ async function runImport() {
   const add = (f, b, key) => {
     const ex = existing.get(key);
     if (ex) {
+      // 앱에서 붙인 사진과 메모는 엑셀에 없으니 그대로 둔다
+      f = f.concat(ex.front.filter(x => x.img));
+      b = b.concat(ex.back.filter(x => x.img || x.l === MEMO));
       if (JSON.stringify(ex.back) !== JSON.stringify(b) || JSON.stringify(ex.front) !== JSON.stringify(f)) {
         const u = { ...ex, front: f, back: b };
         existing.set(key, u);
@@ -1448,7 +1864,7 @@ async function menuDomain(id) {
     const r = await modal({
       title: '색상 바꾸기',
       body: `<div class="chips">${TAB_COLORS.map((c, i) =>
-        `<button type="button" class="chip swatch ${domColor(d) === c ? 'on' : ''}" data-i="${i}" style="--sw:${c}" aria-label="색상 ${i + 1}"></button>`).join('')}</div>`,
+        `<button type="button" class="chip swatch ${domColor(d) === c ? 'on' : ''}" data-mi="${i}" style="--sw:${c}" aria-label="색상 ${i + 1}"></button>`).join('')}</div>`,
       actions: TAB_COLORS.map((_, i) => ({ label: '', value: i, cls: 'hidden' })).concat([{ label: '닫기', value: null }]),
     });
     if (Number.isInteger(r.value)) { await commit({ domains: [{ ...d, color: r.value }] }); render(); }
@@ -1577,33 +1993,72 @@ async function menuCard() {
 
 /* ───────────────────────── 백업 ───────────────────────── */
 
-function backup() {
-  const data = { app: 'flashcards', version: 1, exportedAt: new Date().toISOString() };
-  for (const s of STORES) data[s] = [...S[s].values()];
+const BASE_STORES = ['domains', 'categories', 'decks', 'cards']; // 예전 백업에도 반드시 있는 것
+
+function blobToDataUrl(blob) {
+  return new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = () => rej(r.error); r.readAsDataURL(blob); });
+}
+async function dataUrlToBlob(url) { return (await fetch(url)).blob(); }
+
+function backupName() {
   const d = new Date();
-  const name = `암기장-백업-${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}.json`;
-  const file = new File([JSON.stringify(data)], name, { type: 'application/json' });
+  return `암기장-백업-${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}.json`;
+}
+function shareFile(file) {
   if (navigator.canShare && navigator.canShare({ files: [file] })) {
-    navigator.share({ files: [file], title: name }).catch(e => { if (e.name !== 'AbortError') toast('공유 실패: ' + e.message); });
+    navigator.share({ files: [file], title: file.name }).catch(e => { if (e.name !== 'AbortError') toast('공유 실패: ' + e.message); });
     return;
   }
   const a = document.createElement('a');
   a.href = URL.createObjectURL(file);
-  a.download = name;
+  a.download = file.name;
   document.body.appendChild(a);
   a.click();
   a.remove();
   setTimeout(() => URL.revokeObjectURL(a.href), 5000);
 }
 
+async function backup() {
+  const data = { app: 'flashcards', version: 2, exportedAt: new Date().toISOString() };
+  for (const s of STORES) data[s] = [...S[s].values()];
+  if (!mediaCount) {
+    // 사진이 없으면 기다림 없이 바로 공유(iOS는 탭 직후에만 공유 시트를 허용)
+    data.media = [];
+    return shareFile(new File([JSON.stringify(data)], backupName(), { type: 'application/json' }));
+  }
+  const media = await DB.all('media');
+  data.media = [];
+  for (const m of media) data.media.push({ id: m.id, created: m.created, data: await blobToDataUrl(m.blob) });
+  const file = new File([JSON.stringify(data)], backupName(), { type: 'application/json' });
+  if (!media.length) return shareFile(file);
+  // 사진을 읽느라 시간이 걸리면 iOS가 공유를 막을 수 있어, 한 번 더 눌러 저장하게 한다
+  const r = await modal({
+    title: '백업 파일 준비 완료',
+    body: `<p>사진 ${media.length}장을 포함했어요 (${(file.size / 1048576).toFixed(1)}MB).</p>`,
+    actions: [{ label: '취소', value: null }, { label: '저장하기', value: 'go', cls: 'primary' }],
+  });
+  if (r.value) shareFile(file);
+}
+
 async function restore(file) {
   let data;
   try { data = JSON.parse(await file.text()); } catch { return ui.alert('복원 실패', 'JSON 파일을 읽을 수 없습니다.'); }
-  if (!data || data.app !== 'flashcards' || !STORES.every(s => Array.isArray(data[s]))) return ui.alert('복원 실패', '암기장 백업 파일이 아닙니다.');
+  if (!data || data.app !== 'flashcards' || !BASE_STORES.every(s => Array.isArray(data[s]))) return ui.alert('복원 실패', '암기장 백업 파일이 아닙니다.');
+  const photos = Array.isArray(data.media) ? data.media.length : 0;
   const ok = await ui.confirm('백업 복원',
-    `${data.exportedAt ? fmtDate(Date.parse(data.exportedAt)) + ' 백업 · ' : ''}대분류 ${data.domains.length}개, 암기장 ${data.decks.length}개, 카드 ${data.cards.length}장\n\n현재 데이터는 모두 이 백업으로 교체됩니다.`, '복원', true);
+    `${data.exportedAt ? fmtDate(Date.parse(data.exportedAt)) + ' 백업 · ' : ''}대분류 ${data.domains.length}개, 암기장 ${data.decks.length}개, 카드 ${data.cards.length}장${photos ? `, 사진 ${photos}장` : ''}
+
+현재 데이터는 모두 이 백업으로 교체됩니다.`, '복원', true);
   if (!ok) return;
-  await DB.write(STORES.map(s => ({ store: s, clear: true, put: data[s] })));
+  const media = [];
+  for (const m of data.media || []) {
+    try { media.push({ id: m.id, created: m.created, blob: await dataUrlToBlob(m.data) }); } catch { /* 깨진 사진은 건너뜀 */ }
+  }
+  await DB.write([
+    ...STORES.map(s => ({ store: s, clear: true, put: Array.isArray(data[s]) ? data[s] : [] })),
+    { store: 'media', clear: true, put: media },
+  ]);
+  for (const id of [...mediaUrls.keys()]) forgetMediaUrl(id);
   await loadAll();
   requestPersist();
   study = null;
@@ -1651,9 +2106,15 @@ document.addEventListener('click', async e => {
     case 'backup': return backup();
     case 'edit-card': {
       const r = await editCard(S.cards.get(id));
-      if (r) $('#list').innerHTML = browseList();
+      if (r && V.name === 'browse') $('#list').innerHTML = browseList();
+      if (r && V.name === 'search') { $('#gresults').innerHTML = searchResults(); hydrateMedia(app); }
       return;
     }
+    case 'search': return go('search');
+    case 'pairs': return go('pairs');
+    case 'pair-ask': return askPair(id);
+    case 'pair-done': return donePair(id);
+    case 'focus': return focusMenu();
     case 'add-card': {
       const d = S.decks.get(id);
       const order = cardsOf(id).reduce((m, c) => Math.max(m, c.order + 1), 0);
@@ -1700,6 +2161,11 @@ document.addEventListener('input', e => {
       V.q = t.value;
       history.replaceState({ v: V, depth }, '');
       $('#list').innerHTML = browseList();
+      return;
+    case 'gsearch':
+      V.q = t.value;
+      history.replaceState({ v: V, depth }, '');
+      $('#gresults').innerHTML = searchResults();
       return;
   }
 });
