@@ -391,10 +391,19 @@ function domColor(d) {
 }
 
 /* 연속 학습일 */
-function markStudied() {
+function markStudied(ok) {
   const days = store.get('days', []);
   const k = todayKey();
   if (days[days.length - 1] !== k) { days.push(k); store.set('days', days.slice(-400)); }
+  // 날짜별 학습량·정답 수(통계용). 오래된 기록은 240일치만 남긴다.
+  const log = store.get('log', {});
+  const e = log[k] || { n: 0, ok: 0 };
+  e.n++;
+  if (ok) e.ok++;
+  log[k] = e;
+  const keys = Object.keys(log).sort();
+  if (keys.length > 240) for (const old of keys.slice(0, keys.length - 240)) delete log[old];
+  store.set('log', log);
 }
 function studyDays() {
   const set = new Set(store.get('days', []));
@@ -504,10 +513,14 @@ window.addEventListener('popstate', e => {
 
 function render() {
   clearTimeout(waitTimer);
-  const views = { home: viewHome, deck: viewDeck, study: viewStudy, browse: viewBrowse, import: viewImport, pairs: viewPairs, search: viewSearch };
+  const views = { home: viewHome, deck: viewDeck, study: viewStudy, browse: viewBrowse, import: viewImport, pairs: viewPairs, search: viewSearch, stats: viewStats };
   app.className = 'view-' + V.name;
   app.innerHTML = (views[V.name] || viewHome)();
-  if (V.name === 'study') bindSwipe();
+  if (V.name === 'study') {
+    bindSwipe();
+    const t = $('#typed');
+    if (t) t.focus(); // 주관식 모드에서는 바로 입력할 수 있게
+  }
   hydrateMedia(app);
   updateFocusPill();
 }
@@ -560,6 +573,7 @@ function viewHome() {
           <button class="btn quiz-btn" data-act="study" data-scope="${QUIZ}all" aria-label="객관식 퀴즈">🎯</button>
         </div>
       </section>
+      ${backupNagHtml()}
       ${weakHtml('all')}
       ${pairsHtml()}
       ${doms.map(d => domainHtml(d, m)).join('')}`;
@@ -568,6 +582,7 @@ function viewHome() {
   return `<header class="bar">
       <h1>암기장</h1>
       ${focusT ? focusPill() : ''}
+      <button class="icon-btn" data-act="stats" aria-label="학습 통계">📊</button>
       <button class="icon-btn" data-act="search" aria-label="전체 검색">🔍</button>
       <button class="btn small primary" data-act="import">＋ 가져오기</button>
     </header>
@@ -717,6 +732,8 @@ function startStudy(scope) {
 }
 function pickNext() {
   study.revealed = false;
+  study.typed = '';
+  study.typedOk = null;
   if (study.quiz) {
     study.queue = study.queue.filter(id => S.cards.has(id));
     study.card = S.cards.get(study.queue[0]) || null;
@@ -785,6 +802,18 @@ function viewStudy() {
       hint = `<div class="swipe-hint">${s.practice ? '← 몰랐어요 · 알았어요 →' : '← 다시 · 보통 → · ↑ 쉬움 · ↓ 어려움'} 으로 밀어도 돼요</div>`;
     }
   }
+  const typing = !!deck.typeAnswer && !s.practice;
+  let typedBlock = '';
+  if (typing && s.revealed && s.typed) {
+    const best = acceptedAnswers(c)[0] || '';
+    const d = diffHtml(s.typed, best);
+    typedBlock = `<div class="typed-check ${s.typedOk ? 'ok' : 'no'}">
+      <div class="tc-head">${s.typedOk ? '✓ 정답이에요' : '✕ 아쉬워요'}</div>
+      <div class="tl"><span>입력</span>${d.mine}</div>
+      ${s.typedOk ? '' : `<div class="tl"><span>정답</span>${d.right}</div>`}
+    </div>`;
+  }
+  const suggest = typing && s.typed ? (s.typedOk ? 3 : 1) : 0;
   const buttons = s.practice
     ? `<div class="answer-bar two">
         <button class="ans a1" data-act="ans" data-r="1"><small>한 번 더</small>몰랐어요</button>
@@ -792,7 +821,7 @@ function viewStudy() {
       </div>`
     : `<div class="answer-bar">
         ${[['다시', 1], ['어려움', 2], ['보통', 3], ['쉬움', 4]].map(([l, r]) =>
-          `<button class="ans a${r}" data-act="ans" data-r="${r}"><small>${nextLabel(c, r, now)}</small>${l}</button>`).join('')}
+          `<button class="ans a${r} ${suggest === r ? 'suggest' : ''}" data-act="ans" data-r="${r}"><small>${nextLabel(c, r, now)}</small>${l}</button>`).join('')}
       </div>`;
   return `${head}
   <main style="--tab:${dom ? domColor(dom) : 'var(--accent)'}">
@@ -806,11 +835,17 @@ function viewStudy() {
       <div class="swipe-label" aria-hidden="true"></div>
       <div class="inner">
         <div class="front">${fieldsHtml(c.front, deck)}</div>
-        ${s.revealed ? `<hr><div class="back">${fieldsHtml(c.back, deck)}</div>` : '<div class="tap-hint">탭하면 정답이 보입니다</div>'}
+        ${s.revealed ? `<hr>${typedBlock}<div class="back">${fieldsHtml(c.back, deck)}</div>` : (typing ? '' : '<div class="tap-hint">탭하면 정답이 보입니다</div>')}
       </div>
       ${hint}
     </div>
-    ${s.revealed ? buttons : `<div class="answer-bar one"><button class="btn primary reveal-btn" data-act="reveal">정답 보기</button></div>`}
+    ${s.revealed ? buttons : (typing
+      ? `<div class="type-bar">
+          <input id="typed" type="text" inputmode="text" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false" enterkeyhint="done" placeholder="정답을 입력하세요" value="${esc(s.typed || '')}">
+          <button class="btn primary" data-act="type-submit">확인</button>
+        </div>
+        <div class="type-skip"><button class="link" data-act="type-skip">모르겠어요 · 정답 보기</button></div>`
+      : `<div class="answer-bar one"><button class="btn primary reveal-btn" data-act="reveal">정답 보기</button></div>`)}
   </main>`;
 }
 
@@ -829,7 +864,7 @@ async function answer(r) {
       s.revSinceNew = 0;
     } else if (c.state === 'review') s.revSinceNew++;
     s.done++;
-    markStudied();
+    markStudied(r >= 2);
     focusCount(r >= 2);
     await commit(put);
     pickNext();
@@ -856,7 +891,7 @@ function answerPractice(ok) {
   const id = s.queue.shift();
   if (ok) s.done++;
   else s.queue.splice(Math.min(3, s.queue.length), 0, id); // 몇 장 뒤에 다시 나오게
-  markStudied();
+  markStudied(ok);
   focusCount(ok);
   pickNext();
   render();
@@ -920,7 +955,7 @@ function pickQuiz(i) {
   const ok = s.options[i].correct;
   if (ok) s.right++;
   else { s.wrong.push(s.card.id); recordPair(s.card.id, s.options[i].id); }
-  markStudied();
+  markStudied(ok);
   focusCount(ok);
   render();
   if (ok) {
@@ -1239,6 +1274,281 @@ function searchResults() {
         <button class="sr-go" data-act="open-deck" data-id="${c.deckId}" aria-label="암기장 열기">›</button>
       </div>`;
     }).join('');
+}
+
+/* ───────────────────────── 학습 통계 ───────────────────────── */
+
+const dayKeyOf = d => `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`;
+function dayBack(n) {
+  const d = new Date(startOfDay());
+  d.setDate(d.getDate() - n);
+  return d;
+}
+function statsSummary() {
+  const log = store.get('log', {});
+  const days = new Set(store.get('days', []));
+  const sum = n => {
+    let cards = 0, ok = 0;
+    for (let i = 0; i < n; i++) { const e = log[dayKeyOf(dayBack(i))]; if (e) { cards += e.n; ok += e.ok; } }
+    return { cards, ok };
+  };
+  const total = Object.values(log).reduce((a, e) => a + e.n, 0);
+  // 최장 연속일
+  const sorted = [...days].map(k => { const [y, m, d] = k.split('-').map(Number); return new Date(y, m - 1, d).getTime(); }).sort((a, b) => a - b);
+  let best = 0, run = 0, prev = null;
+  for (const t of sorted) {
+    run = prev !== null && Math.round((t - prev) / DAY) === 1 ? run + 1 : 1;
+    best = Math.max(best, run);
+    prev = t;
+  }
+  const m30 = sum(30);
+  return { today: sum(1).cards, week: sum(7).cards, month: m30.cards, total, acc: m30.cards ? Math.round((m30.ok / m30.cards) * 100) : null, streak: studyDays().streak, best };
+}
+/** 앞으로 7일간 복습 예정 카드 수 */
+function forecast() {
+  const now = Date.now();
+  const out = Array.from({ length: 7 }, (_, i) => ({ d: new Date(startOfDay() + 0), n: 0 }));
+  for (let i = 0; i < 7; i++) { const d = new Date(startOfDay()); d.setDate(d.getDate() + i); out[i].d = d; }
+  const edge = i => dueInDays(i + 1, now);
+  for (const c of S.cards.values()) {
+    if (c.suspended || c.state === 'new') continue;
+    for (let i = 0; i < 7; i++) {
+      if (c.due < edge(i)) { out[i].n++; break; }
+    }
+  }
+  return out;
+}
+
+function viewStats() {
+  const log = store.get('log', {});
+  const st = statsSummary();
+  const WEEKS = 13;
+  // 잔디: 오늘이 포함된 주가 맨 오른쪽
+  const offsetToSat = 6 - new Date(startOfDay()).getDay();
+  const cells = [];
+  for (let w = WEEKS - 1; w >= 0; w--) {
+    for (let dow = 0; dow < 7; dow++) {
+      const back = w * 7 + (6 - dow) - offsetToSat;
+      const d = dayBack(back);
+      const n = back < 0 ? -1 : (log[dayKeyOf(d)]?.n || 0);
+      cells.push({ n, d, future: back < 0 });
+    }
+  }
+  const lvl = n => (n <= 0 ? 0 : n < 10 ? 1 : n < 20 ? 2 : n < 40 ? 3 : 4);
+  const grass = cells.map(c => c.future
+    ? '<i class="g future"></i>'
+    : `<i class="g l${lvl(c.n)}" data-act="grass" data-d="${c.d.getMonth() + 1}/${c.d.getDate()}" data-n="${c.n}" title="${c.d.getMonth() + 1}/${c.d.getDate()} · ${c.n}장"></i>`).join('');
+
+  const fc = forecast();
+  const max = Math.max(1, ...fc.map(f => f.n));
+  const bars = fc.map((f, i) => `<div class="fb">
+      <div class="fbar"><i style="height:${Math.round((f.n / max) * 100)}%"></i></div>
+      <div class="fn">${f.n || ''}</div>
+      <div class="fd">${i === 0 ? '오늘' : '일월화수목금토'[f.d.getDay()]}</div>
+    </div>`).join('');
+
+  const t = sumTally(tally(), [...S.decks.keys()]);
+  let neu = 0, learn = 0, rev = 0, susp = 0;
+  for (const c of S.cards.values()) {
+    if (c.suspended) susp++;
+    else if (c.state === 'new') neu++;
+    else if (c.state === 'review') rev++;
+    else learn++;
+  }
+  const all = Math.max(1, neu + learn + rev + susp);
+  const seg = (n, cls, label) => n ? `<i class="${cls}" style="width:${(n / all) * 100}%" title="${label} ${n}장"></i>` : '';
+
+  return `${bar('📊 학습 통계')}
+  <main>
+    <div class="stat-grid">
+      <div class="stat n"><div class="v">${st.today}</div><div class="k">오늘 학습</div></div>
+      <div class="stat l"><div class="v">${st.streak}</div><div class="k">연속 일수</div></div>
+      <div class="stat r"><div class="v">${st.acc == null ? '–' : st.acc + '%'}</div><div class="k">30일 정답률</div></div>
+    </div>
+
+    <section class="panel">
+      <h3>학습 잔디</h3>
+      <div class="grass-wrap"><div class="grass">${grass}</div></div>
+      <div class="grass-legend"><span class="muted">적음</span><i class="g l0"></i><i class="g l1"></i><i class="g l2"></i><i class="g l3"></i><i class="g l4"></i><span class="muted">많음</span></div>
+      <div id="grass-info" class="muted" style="text-align:center;margin-top:8px">최근 ${WEEKS}주 · 누적 ${st.total}장</div>
+    </section>
+
+    <section class="panel">
+      <h3>복습 예보</h3>
+      <div class="forecast">${bars}</div>
+      <p class="muted" style="margin:10px 0 0">앞으로 7일 동안 돌아올 복습 카드 수예요. 새 카드는 빠져 있습니다.</p>
+    </section>
+
+    <section class="panel">
+      <h3>카드 상태</h3>
+      <div class="segbar">${seg(rev, 'sg-r', '복습')}${seg(learn, 'sg-l', '학습 중')}${seg(neu, 'sg-n', '새 카드')}${seg(susp, 'sg-s', '일시중지')}</div>
+      <div class="kv"><span>복습 단계</span><span>${rev}장</span></div>
+      <div class="kv"><span>학습 중</span><span>${learn}장</span></div>
+      <div class="kv"><span>아직 안 본 카드</span><span>${neu}장</span></div>
+      <div class="kv"><span>일시중지</span><span>${susp}장</span></div>
+    </section>
+
+    <section class="panel">
+      <div class="kv"><span>이번 주 학습</span><span>${st.week}장</span></div>
+      <div class="kv"><span>최근 30일</span><span>${st.month}장</span></div>
+      <div class="kv"><span>최장 연속</span><span>${st.best}일</span></div>
+      <div class="kv"><span>오늘 남은 카드</span><span>${t.n + t.l + t.r}장</span></div>
+    </section>
+  </main>`;
+}
+
+/* ───────────────────────── 백업 알림 / 암기장 내보내기 ───────────────────────── */
+
+const BACKUP_EVERY = 7 * DAY;
+const markBackup = () => store.set('lastBackup', Date.now());
+function backupDue() {
+  if (S.cards.size < 20) return 0;
+  const last = store.get('lastBackup', 0);
+  const snooze = store.get('backupSnooze', 0);
+  if (Date.now() - snooze < 3 * DAY) return 0;
+  const since = Date.now() - last;
+  if (since < BACKUP_EVERY) return 0;
+  return last ? Math.floor(since / DAY) : -1; // -1: 한 번도 백업한 적 없음
+}
+function backupNagHtml() {
+  const d = backupDue();
+  if (!d) return '';
+  return `<div class="nag">
+    <span class="ni">💾</span>
+    <span class="nt">${d < 0 ? '아직 백업한 적이 없어요' : `마지막 백업이 ${d}일 전이에요`}<small>카드는 이 기기에만 있어요. 앱을 지우면 함께 사라집니다.</small></span>
+    <span class="na"><button class="btn small primary" data-act="backup">지금 백업</button><button class="btn small" data-act="nag-later">나중에</button></span>
+  </div>`;
+}
+
+/** 암기장 하나를 엑셀(.xlsx)로 내보낸다. 사진은 제외. */
+function exportDeckXlsx(deck) {
+  const cards = cardsOf(deck.id).sort((a, b) => a.order - b.order);
+  if (!cards.length) return toast('내보낼 카드가 없어요');
+  const labels = { front: [], back: [] };
+  for (const c of cards) for (const side of ['front', 'back']) {
+    for (const f of c[side]) if (!f.img && !labels[side].includes(f.l)) labels[side].push(f.l);
+  }
+  const head = [...labels.front, ...labels.back.map(l => (labels.front.includes(l) ? `${l} (뒷면)` : l))];
+  const rows = cards.map(c => [
+    ...labels.front.map(l => c.front.filter(f => f.l === l && !f.img).map(f => f.v).join('\n')),
+    ...labels.back.map(l => c.back.filter(f => f.l === l && !f.img).map(f => f.v).join('\n')),
+  ]);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([head, ...rows]), deck.name.slice(0, 28) || 'cards');
+  const buf = XLSX.write(wb, { type: 'array', bookType: 'xlsx' });
+  shareFile(new File([buf], `${deck.name}.xlsx`, { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }));
+  const imgs = cards.filter(c => mediaIdsOf(c).length).length;
+  if (imgs) toast(`사진이 있는 카드 ${imgs}장의 사진은 엑셀에 담기지 않아요`);
+}
+
+/** 암기장 하나를 학습 기록·사진까지 담아 JSON으로 내보낸다. */
+async function exportDeckJson(deck) {
+  const cards = cardsOf(deck.id).sort((a, b) => a.order - b.order);
+  const ids = new Set(cards.flatMap(mediaIdsOf));
+  const media = [];
+  for (const id of ids) {
+    const m = await DB.get('media', id);
+    if (m) media.push({ id: m.id, created: m.created, data: await blobToDataUrl(m.blob) });
+  }
+  const data = { app: 'flashcards-deck', version: 1, exportedAt: new Date().toISOString(), path: catPath(deck.catId), deck, cards, media };
+  const file = new File([JSON.stringify(data)], `${deck.name}.json`, { type: 'application/json' });
+  if (!media.length) return shareFile(file);
+  const r = await modal({
+    title: '내보내기 준비 완료',
+    body: `<p>${cards.length}장 · 사진 ${media.length}장 (${(file.size / 1048576).toFixed(1)}MB)</p>`,
+    actions: [{ label: '취소', value: null }, { label: '저장하기', value: 'go', cls: 'primary' }],
+  });
+  if (r.value) shareFile(file);
+}
+
+async function exportDeck(deckId) {
+  const deck = S.decks.get(deckId);
+  const a = await ui.menu(`${deck.name} 내보내기`, [
+    { label: '📊 엑셀 파일 (.xlsx)', value: 'xlsx' },
+    { label: '💾 백업 파일 (.json · 학습 기록·사진 포함)', value: 'json' },
+  ]);
+  if (a === 'xlsx') exportDeckXlsx(deck);
+  else if (a === 'json') exportDeckJson(deck);
+}
+
+/** 암기장 백업 파일(.json)을 새 암기장으로 가져온다. */
+async function importDeckFile(data) {
+  const cards = Array.isArray(data.cards) ? data.cards : [];
+  const targets = domainList().flatMap(dm => catsOf(dm.id).map(c => ({ label: `${dm.name} › ${c.name}`, value: c.id })));
+  let catId;
+  if (!targets.length) {
+    const dom = { id: uid(), name: '가져온 암기장', created: Date.now() };
+    const cat = { id: uid(), domainId: dom.id, name: data.path || '기타', created: Date.now() };
+    await commit({ domains: [dom], categories: [cat] });
+    catId = cat.id;
+  } else {
+    catId = await ui.menu(`'${data.deck.name}' 을(를) 어디에 넣을까요?`, targets);
+    if (!catId) return;
+  }
+  const now = Date.now();
+  const mediaMap = new Map();
+  const media = [];
+  for (const m of data.media || []) {
+    const nid = uid();
+    mediaMap.set(m.id, nid);
+    try { media.push({ id: nid, created: m.created || now, blob: await dataUrlToBlob(m.data) }); } catch { /* 깨진 사진은 건너뜀 */ }
+  }
+  const deck = { ...data.deck, id: uid(), catId, created: now };
+  const remap = fields => (fields || []).map(f => (f.img && mediaMap.has(f.img) ? { ...f, img: mediaMap.get(f.img) } : f));
+  const newCards = cards.map(c => ({ ...c, id: uid(), deckId: deck.id, front: remap(c.front), back: remap(c.back) }));
+  await commit({ decks: [deck], cards: newCards, media });
+  requestPersist();
+  go('deck', { id: deck.id });
+  ui.alert('가져오기 완료', `'${deck.name}' 암기장에 카드 ${newCards.length}장을 학습 기록과 함께 넣었어요.`);
+}
+
+/* ───────────────────────── 주관식 입력 ───────────────────────── */
+// 암기장 설정에서 켜면, 정답을 보기 전에 직접 입력해 맞춰 본다.
+
+const normAnswer = s => s.trim().toLowerCase().replace(/\s+/g, ' ').replace(/[.,!?;:·]/g, '');
+/** 뒷면에서 정답으로 인정할 문자열들 */
+function acceptedAnswers(card) {
+  const out = [];
+  for (const f of card.back) {
+    if (f.img || f.l === MEMO || !f.v) continue;
+    out.push(f.v);
+    for (const part of f.v.split(/[/,;]|\n/)) if (part.trim()) out.push(part.trim());
+  }
+  return out;
+}
+function checkTyped(card, typed) {
+  const t = normAnswer(typed);
+  if (!t) return false;
+  return acceptedAnswers(card).some(a => normAnswer(a) === t);
+}
+/** 입력한 답과 정답을 글자 단위로 비교해 표시한다(LCS) */
+function diffHtml(typed, answer) {
+  const a = [...typed], b = [...answer];
+  const m = Array.from({ length: a.length + 1 }, () => new Array(b.length + 1).fill(0));
+  for (let i = a.length - 1; i >= 0; i--) {
+    for (let j = b.length - 1; j >= 0; j--) {
+      m[i][j] = a[i].toLowerCase() === b[j].toLowerCase() ? m[i + 1][j + 1] + 1 : Math.max(m[i + 1][j], m[i][j + 1]);
+    }
+  }
+  let i = 0, j = 0, mine = '', right = '';
+  while (i < a.length && j < b.length) {
+    if (a[i].toLowerCase() === b[j].toLowerCase()) { mine += `<b>${esc(a[i])}</b>`; right += `<b>${esc(b[j])}</b>`; i++; j++; }
+    else if (m[i + 1][j] >= m[i][j + 1]) { mine += `<u class="bad">${esc(a[i])}</u>`; i++; }
+    else { right += `<u class="miss">${esc(b[j])}</u>`; j++; }
+  }
+  mine += a.slice(i).map(ch => `<u class="bad">${esc(ch)}</u>`).join('');
+  right += b.slice(j).map(ch => `<u class="miss">${esc(ch)}</u>`).join('');
+  return { mine, right };
+}
+function submitTyped() {
+  const s = study;
+  const el = $('#typed');
+  if (!s || !s.card || s.revealed || !el) return;
+  s.typed = el.value;
+  s.typedOk = checkTyped(s.card, s.typed);
+  s.revealed = true;
+  s.flip = true;
+  render();
 }
 
 /* ───────────────────────── 약점 카드 ───────────────────────── */
@@ -1923,6 +2233,8 @@ async function menuDeck(id) {
   const labels = d.showLabels !== false;
   const a = await ui.menu(d.name, [
     { label: `📅 시험일 모드 ${d.examDate ? `(${d.examDate})` : '설정'}`, value: 'exam' },
+    { label: d.typeAnswer ? '✏️ 주관식 입력 끄기' : '✏️ 주관식 입력 켜기', value: 'typing' },
+    { label: '📤 내보내기 (엑셀 · 백업)', value: 'export' },
     { label: '이름 변경', value: 'rename' },
     { label: `하루 새 카드 수 (현재 ${d.newPerDay ?? CFG.newPerDay}장)`, value: 'limit' },
     { label: labels ? '카드에 컬럼명 숨기기' : '카드에 컬럼명 표시하기', value: 'labels' },
@@ -1931,6 +2243,13 @@ async function menuDeck(id) {
     { label: '암기장 삭제', value: 'delete', danger: true },
   ]);
   if (a === 'exam') return setExam(id);
+  if (a === 'export') return exportDeck(id);
+  if (a === 'typing') {
+    await commit({ decks: [{ ...d, typeAnswer: !d.typeAnswer }] });
+    toast(d.typeAnswer ? '정답을 눌러서 확인해요' : '정답을 직접 입력해서 확인해요');
+    study = null;
+    return render();
+  }
   if (a === 'rename') {
     const name = await ui.prompt('암기장 이름 변경', d.name);
     if (name) { await commit({ decks: [{ ...d, name }] }); render(); }
@@ -2024,6 +2343,7 @@ async function backup() {
   if (!mediaCount) {
     // 사진이 없으면 기다림 없이 바로 공유(iOS는 탭 직후에만 공유 시트를 허용)
     data.media = [];
+    markBackup();
     return shareFile(new File([JSON.stringify(data)], backupName(), { type: 'application/json' }));
   }
   const media = await DB.all('media');
@@ -2037,12 +2357,13 @@ async function backup() {
     body: `<p>사진 ${media.length}장을 포함했어요 (${(file.size / 1048576).toFixed(1)}MB).</p>`,
     actions: [{ label: '취소', value: null }, { label: '저장하기', value: 'go', cls: 'primary' }],
   });
-  if (r.value) shareFile(file);
+  if (r.value) { markBackup(); shareFile(file); }
 }
 
 async function restore(file) {
   let data;
   try { data = JSON.parse(await file.text()); } catch { return ui.alert('복원 실패', 'JSON 파일을 읽을 수 없습니다.'); }
+  if (data && data.app === 'flashcards-deck' && data.deck && Array.isArray(data.cards)) return importDeckFile(data);
   if (!data || data.app !== 'flashcards' || !BASE_STORES.every(s => Array.isArray(data[s]))) return ui.alert('복원 실패', '암기장 백업 파일이 아닙니다.');
   const photos = Array.isArray(data.media) ? data.media.length : 0;
   const ok = await ui.confirm('백업 복원',
@@ -2111,6 +2432,16 @@ document.addEventListener('click', async e => {
       return;
     }
     case 'search': return go('search');
+    case 'stats': return go('stats');
+    case 'nag-later': store.set('backupSnooze', Date.now()); return render();
+    case 'export-deck': return exportDeck(id);
+    case 'type-submit': return submitTyped();
+    case 'type-skip': { study.typed = ''; study.typedOk = null; study.revealed = true; study.flip = true; return render(); }
+    case 'grass': {
+      const info = $('#grass-info');
+      if (info) info.textContent = `${el.dataset.d} · ${el.dataset.n}장 학습`;
+      return;
+    }
     case 'pairs': return go('pairs');
     case 'pair-ask': return askPair(id);
     case 'pair-done': return donePair(id);
@@ -2173,6 +2504,7 @@ document.addEventListener('input', e => {
 // 데스크톱 단축키: Space/Enter 정답 보기·보통, 1~4 평가, Z 되돌리기
 document.addEventListener('keydown', e => {
   if (V.name !== 'study' || !study || $('.overlay') || e.metaKey || e.ctrlKey || e.altKey) return;
+  if (e.key === 'Enter' && e.target.id === 'typed') { e.preventDefault(); return submitTyped(); }
   if (/^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName)) return;
   if (study.quiz) {
     if (study.picked == null && /^[1-4]$/.test(e.key)) pickQuiz(+e.key - 1);

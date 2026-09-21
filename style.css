@@ -721,3 +721,62 @@ input[type=date] {
 .search-row .sp { font-size: 11.5px; color: var(--muted); font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .search-row .cf, .search-row .cb { grid-column: auto; }
 mark { background: color-mix(in srgb, var(--accent) 22%, transparent); color: inherit; border-radius: 4px; padding: 0 1px; }
+
+/* ── 백업 알림 ── */
+.nag {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  background: var(--hard-bg);
+  border-radius: 20px;
+  padding: 14px 16px;
+  margin-bottom: 16px;
+}
+.nag .ni { font-size: 24px; }
+.nag .nt { flex: 1; min-width: 140px; font-weight: 700; font-size: 14.5px; display: flex; flex-direction: column; gap: 2px; }
+.nag .nt small { font-weight: 500; font-size: 12.5px; color: var(--muted); }
+.nag .na { display: flex; gap: 6px; }
+.nag .btn { box-shadow: none; }
+
+/* ── 학습 통계 ── */
+.grass-wrap { overflow-x: auto; padding-bottom: 4px; }
+.grass { display: grid; grid-auto-flow: column; grid-template-rows: repeat(7, 1fr); gap: 3px; width: max-content; margin: 0 auto; }
+.g { width: 13px; height: 13px; border-radius: 3px; background: var(--surface-2); display: block; }
+.g.l1 { background: color-mix(in srgb, var(--accent) 28%, var(--surface-2)); }
+.g.l2 { background: color-mix(in srgb, var(--accent) 52%, var(--surface-2)); }
+.g.l3 { background: color-mix(in srgb, var(--accent) 76%, var(--surface-2)); }
+.g.l4 { background: var(--accent); }
+.g.future { background: transparent; }
+.grass-legend { display: flex; align-items: center; gap: 4px; justify-content: flex-end; margin-top: 8px; }
+.grass-legend .muted { font-size: 12px; }
+.forecast { display: grid; grid-template-columns: repeat(7, 1fr); gap: 6px; align-items: end; }
+.fb { text-align: center; }
+.fbar { height: 84px; display: flex; align-items: flex-end; justify-content: center; }
+.fbar i { display: block; width: 68%; min-height: 3px; border-radius: 8px 8px 3px 3px; background: var(--grad); }
+.fn { font-size: 12px; font-weight: 800; margin-top: 4px; min-height: 16px; }
+.fd { font-size: 12px; color: var(--muted); font-weight: 600; }
+.segbar { display: flex; height: 14px; border-radius: 99px; overflow: hidden; background: var(--surface-2); margin-bottom: 12px; }
+.segbar i { display: block; height: 100%; }
+.sg-r { background: var(--review-fg); }
+.sg-l { background: var(--learn-fg); }
+.sg-n { background: var(--new-fg); }
+.sg-s { background: var(--muted); }
+
+/* ── 주관식 입력 ── */
+.type-bar { display: flex; gap: 8px; padding-top: 14px; }
+.type-bar input { flex: 1; min-width: 0; min-height: 52px; border-radius: 16px; font-size: 17px; text-align: center; }
+.type-bar .btn { flex: none; min-height: 52px; padding: 0 20px; }
+.type-skip { text-align: center; padding: 10px 0 calc(var(--safe-bottom) + 10px); }
+.type-skip .link { font-size: 14px; color: var(--muted); }
+.typed-check { border-radius: 16px; padding: 12px 14px; margin-bottom: 14px; text-align: left; background: var(--again-bg); }
+.typed-check.ok { background: var(--good-bg); }
+.tc-head { font-weight: 800; font-size: 15px; margin-bottom: 6px; color: var(--again-fg); text-align: center; }
+.typed-check.ok .tc-head { color: var(--good-fg); }
+.tl { font-size: 15px; line-height: 1.5; word-break: break-all; }
+.tl + .tl { margin-top: 4px; }
+.tl span { display: inline-block; min-width: 38px; font-size: 12px; font-weight: 700; color: var(--muted); }
+.tl b { font-weight: 700; }
+.tl u.bad { text-decoration: line-through; color: var(--again-fg); opacity: .8; }
+.tl u.miss { text-decoration: none; font-weight: 800; color: var(--good-fg); background: color-mix(in srgb, var(--good-fg) 16%, transparent); border-radius: 3px; }
+.ans.suggest { outline: 2.5px solid currentColor; outline-offset: -2px; }
