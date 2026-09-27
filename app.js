@@ -57,12 +57,18 @@ function fmtDate(ts) {
 }
 
 let toastTimer;
-function toast(msg) {
+/** toast('저장했어요') 또는 toast('삭제됨', { label: '되돌리기', fn }) */
+function toast(msg, action) {
   const t = $('#toast');
-  t.textContent = msg;
+  t.innerHTML = `<span>${esc(msg)}</span>${action ? `<button type="button" class="toast-btn">${esc(action.label)}</button>` : ''}`;
+  if (action) t.querySelector('.toast-btn').onclick = () => { hideToast(); action.fn(); };
   t.classList.add('show');
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => t.classList.remove('show'), 2600);
+  toastTimer = setTimeout(hideToast, action ? 9000 : 2600);
+}
+function hideToast() {
+  clearTimeout(toastTimer);
+  $('#toast').classList.remove('show');
 }
 
 const store = {
@@ -168,11 +174,44 @@ async function commit(put = {}, del = {}) {
     ops.push({ store: s, del: ids });
   }
   if (!ops.length) return;
-  try { await DB.write(ops); } catch (e) { toast('저장 실패: ' + e.message); throw e; }
+  try {
+    await DB.write(ops);
+  } catch (e) {
+    if (isQuotaError(e)) toast('저장 공간이 부족해요', { label: '정리하기', fn: () => go('storage') });
+    else toast('저장 실패: ' + e.message);
+    throw e;
+  }
 }
 
 function requestPersist() {
   try { navigator.storage && navigator.storage.persist && navigator.storage.persist(); } catch { /* 무시 */ }
+}
+
+/** 지운 내용을 잠시 들고 있다가 '되돌리기'로 살려 준다(사진 원본까지 보관). */
+async function deleteWithUndo(name, del) {
+  const snap = { domains: [], categories: [], decks: [], cards: [], pairs: [], media: [] };
+  for (const s of ['domains', 'categories', 'decks', 'cards', 'pairs']) {
+    for (const id of del[s] || []) { const o = S[s].get(id); if (o) snap[s].push(o); }
+  }
+  const cardIds = new Set(del.cards || []);
+  if (cardIds.size) {
+    // 카드와 함께 지워지는 사진·헷갈림 짝도 미리 떠 둔다
+    for (const p of S.pairs.values()) if (cardIds.has(p.a) || cardIds.has(p.b)) snap.pairs.push(p);
+    for (const id of cardIds) {
+      const c = S.cards.get(id);
+      for (const mid of c ? mediaIdsOf(c) : []) { const m = await DB.get('media', mid); if (m) snap.media.push(m); }
+    }
+  }
+  await commit({}, del);
+  const n = snap.cards.length;
+  toast(`${name} 삭제됨${n ? ` · 카드 ${n}장` : ''}`, {
+    label: '되돌리기',
+    fn: async () => {
+      await commit(snap);
+      toast('되돌렸어요');
+      render();
+    },
+  });
 }
 
 /* ───────────────────────── 사진 ───────────────────────── */
@@ -219,6 +258,7 @@ async function saveImage(file) {
   cv.getContext('2d').drawImage(im, 0, 0, cv.width, cv.height);
   const blob = await new Promise(r => cv.toBlob(r, 'image/jpeg', 0.82));
   if (!blob) throw new Error('이미지를 변환할 수 없습니다');
+  await warnIfTight(blob.size);
   const id = uid();
   await commit({ media: [{ id, blob, created: Date.now() }] });
   requestPersist();
@@ -513,7 +553,7 @@ window.addEventListener('popstate', e => {
 
 function render() {
   clearTimeout(waitTimer);
-  const views = { home: viewHome, deck: viewDeck, study: viewStudy, browse: viewBrowse, import: viewImport, pairs: viewPairs, search: viewSearch, stats: viewStats };
+  const views = { home: viewHome, deck: viewDeck, study: viewStudy, browse: viewBrowse, import: viewImport, pairs: viewPairs, search: viewSearch, stats: viewStats, storage: viewStorage };
   app.className = 'view-' + V.name;
   app.innerHTML = (views[V.name] || viewHome)();
   if (V.name === 'study') {
@@ -594,6 +634,7 @@ function viewHome() {
           <button class="btn" data-act="backup">백업 내보내기</button>
           <label class="btn file-btn" style="flex:1">백업 복원<input type="file" id="restore-file" accept=".json,application/json"></label>
         </div>
+        <button class="btn" data-act="storage">저장 공간 관리</button>
       </div>
       <div class="version muted">암기장 v${APP_VERSION} · 데이터는 이 기기에만 저장됩니다</div>
     </main>`;
@@ -1105,8 +1146,7 @@ ${txt(S.cards.get(p.b))}
 질문: 두 내용의 차이를 비교해서 설명하고, 앞으로 헷갈리지 않게 구분하는 요령을 알려 줘.`);
 }
 async function donePair(id) {
-  await commit({}, { pairs: [id] });
-  toast('정리했어요. 다시 헷갈리면 또 기록돼요');
+  await deleteWithUndo('헷갈림 짝', { pairs: [id] });
   render();
 }
 
@@ -1395,6 +1435,107 @@ function viewStats() {
       <div class="kv"><span>오늘 남은 카드</span><span>${t.n + t.l + t.r}장</span></div>
     </section>
   </main>`;
+}
+
+/* ───────────────────────── 저장 공간 ───────────────────────── */
+
+const isQuotaError = e => !!e && (e.name === 'QuotaExceededError' || e.name === 'NS_ERROR_DOM_QUOTA_REACHED' || /quota|storage|공간/i.test(e.message || ''));
+function fmtBytes(n) {
+  if (n == null) return '–';
+  if (n < 1024) return `${n}B`;
+  if (n < 1048576) return `${(n / 1024).toFixed(0)}KB`;
+  if (n < 1073741824) return `${(n / 1048576).toFixed(1)}MB`;
+  return `${(n / 1073741824).toFixed(2)}GB`;
+}
+
+/** 남은 공간이 빠듯하면 사진을 더 넣기 전에 미리 알려 준다 */
+async function warnIfTight(addBytes = 0) {
+  try {
+    if (!navigator.storage || !navigator.storage.estimate) return;
+    const { usage, quota } = await navigator.storage.estimate();
+    if (!quota) return;
+    const left = quota - usage - addBytes;
+    if (left < 20 * 1048576 || (usage + addBytes) / quota > 0.9) {
+      toast(`저장 공간이 ${fmtBytes(Math.max(0, left))} 남았어요`, { label: '정리하기', fn: () => { storageInfo = null; go('storage'); } });
+    }
+  } catch { /* 사용량을 알 수 없는 브라우저 */ }
+}
+
+let storageInfo = null;
+async function loadStorage() {
+  const est = navigator.storage && navigator.storage.estimate ? await navigator.storage.estimate().catch(() => null) : null;
+  const media = await DB.all('media').catch(() => []);
+  const used = new Set([...S.cards.values()].flatMap(mediaIdsOf));
+  const orphans = media.filter(m => !used.has(m.id));
+  const size = list => list.reduce((a, m) => a + ((m.blob && m.blob.size) || 0), 0);
+  storageInfo = {
+    usage: est ? est.usage : null,
+    quota: est ? est.quota : null,
+    persisted: navigator.storage && navigator.storage.persisted ? await navigator.storage.persisted().catch(() => false) : false,
+    photos: media.length,
+    photoBytes: size(media),
+    orphans: orphans.map(m => m.id),
+    orphanBytes: size(orphans),
+  };
+  if (V.name === 'storage') render();
+}
+
+function viewStorage() {
+  if (!storageInfo) queueMicrotask(loadStorage);
+  const i = storageInfo;
+  const head = bar('저장 공간');
+  if (!i) return `${head}<main><p class="muted" style="text-align:center;padding:40px 0">계산하는 중…</p></main>`;
+  const pct = i.usage != null && i.quota ? Math.min(100, Math.round((i.usage / i.quota) * 100)) : null;
+  const tight = pct != null && pct >= 80;
+  return `${head}
+  <main>
+    <section class="panel">
+      <h3>이 기기에서 쓰는 공간</h3>
+      ${pct == null
+        ? '<p class="muted">이 브라우저는 사용량을 알려 주지 않아요.</p>'
+        : `<div class="use-num ${tight ? 'tight' : ''}">${fmtBytes(i.usage)} <small>/ ${fmtBytes(i.quota)} 사용 가능</small></div>
+           <div class="segbar"><i class="${tight ? 'sg-l' : 'sg-r'}" style="width:${Math.max(2, pct)}%"></i></div>
+           ${tight ? '<p class="muted">공간이 얼마 남지 않았어요. 사진을 정리하거나 백업 후 정리해 보세요.</p>' : ''}`}
+      <div class="kv"><span>카드</span><span>${S.cards.size}장</span></div>
+      <div class="kv"><span>사진</span><span>${i.photos}장 · ${fmtBytes(i.photoBytes)}</span></div>
+      <div class="kv"><span>안 쓰는 사진</span><span>${i.orphans.length}장 · ${fmtBytes(i.orphanBytes)}</span></div>
+      <div class="kv"><span>영구 저장</span><span>${i.persisted ? '켜짐' : '꺼짐'}</span></div>
+    </section>
+
+    <div class="footer-actions" style="margin-top:0">
+      ${i.orphans.length ? `<button class="btn primary" data-act="gc-media">안 쓰는 사진 ${i.orphans.length}장 지우기 (${fmtBytes(i.orphanBytes)})</button>` : ''}
+      ${i.persisted ? '' : '<button class="btn" data-act="persist">영구 저장 켜기</button>'}
+      <button class="btn" data-act="backup">지금 백업 내보내기</button>
+    </div>
+
+    <section class="panel" style="margin-top:14px">
+      <p class="muted" style="margin:0">
+        ${i.persisted
+          ? '영구 저장이 켜져 있어 기기 공간이 부족해도 이 앱 데이터가 먼저 지워지지 않아요.'
+          : '영구 저장을 켜면 기기 공간이 부족할 때 이 앱 데이터가 먼저 지워지는 것을 막아 줘요. 홈 화면에 추가한 앱에서 더 잘 켜집니다.'}
+        사진은 긴 변 1400px JPEG로 줄여서 저장해요.
+      </p>
+    </section>
+  </main>`;
+}
+
+async function gcMedia() {
+  const ids = storageInfo ? storageInfo.orphans : [];
+  if (!ids.length) return;
+  if (!(await ui.confirm('안 쓰는 사진 정리', `어느 카드에도 붙어 있지 않은 사진 ${ids.length}장(${fmtBytes(storageInfo.orphanBytes)})을 지웁니다.`, '지우기', true))) return;
+  await commit({}, { media: ids });
+  storageInfo = null;
+  toast(`사진 ${ids.length}장을 정리했어요`);
+  await loadStorage();
+}
+
+async function askPersist() {
+  try {
+    const ok = navigator.storage && navigator.storage.persist ? await navigator.storage.persist() : false;
+    toast(ok ? '영구 저장을 켰어요' : '브라우저가 영구 저장을 허용하지 않았어요');
+  } catch { toast('이 브라우저에서는 지원하지 않아요'); }
+  storageInfo = null;
+  await loadStorage();
 }
 
 /* ───────────────────────── 백업 알림 / 암기장 내보내기 ───────────────────────── */
@@ -1825,7 +1966,7 @@ async function editCard(card, isNew = false) {
   if (r.value === 'delete') {
     if (!(await ui.confirm('카드 삭제', '이 카드를 삭제할까요?', '삭제', true))) { await dropNew(); return null; }
     await dropNew();
-    await commit({}, { cards: [card.id] });
+    await deleteWithUndo('카드', { cards: [card.id] });
     return 'deleted';
   }
   const read = s => [...r.el.querySelectorAll(`textarea[data-side="${s}"]`)]
@@ -2189,8 +2330,8 @@ async function menuDomain(id) {
     const cats = catsOf(id).map(c => c.id);
     const decks = scopeDecks('dom:' + id);
     const n = countUnder(decks);
-    if (!(await ui.confirm(`'${d.name}' 삭제`, `소분류 ${cats.length}개, 암기장 ${decks.length}개, 카드 ${n}장이 함께 삭제됩니다.\n되돌릴 수 없습니다.`, '삭제', true))) return;
-    await commit({}, { domains: [id], categories: cats, decks, cards: cardIdsIn(decks) });
+    if (!(await ui.confirm(`'${d.name}' 삭제`, `소분류 ${cats.length}개, 암기장 ${decks.length}개, 카드 ${n}장이 함께 삭제됩니다.`, '삭제', true))) return;
+    await deleteWithUndo(`'${d.name}'`, { domains: [id], categories: cats, decks, cards: cardIdsIn(decks) });
     render();
   }
 }
@@ -2222,8 +2363,8 @@ async function menuCat(id) {
   }
   if (a === 'delete') {
     const decks = decksOf(id).map(d => d.id);
-    if (!(await ui.confirm(`'${c.name}' 삭제`, `암기장 ${decks.length}개, 카드 ${countUnder(decks)}장이 함께 삭제됩니다.\n되돌릴 수 없습니다.`, '삭제', true))) return;
-    await commit({}, { categories: [id], decks, cards: cardIdsIn(decks) });
+    if (!(await ui.confirm(`'${c.name}' 삭제`, `암기장 ${decks.length}개, 카드 ${countUnder(decks)}장이 함께 삭제됩니다.`, '삭제', true))) return;
+    await deleteWithUndo(`'${c.name}'`, { categories: [id], decks, cards: cardIdsIn(decks) });
     render();
   }
 }
@@ -2272,8 +2413,8 @@ async function menuDeck(id) {
     render();
   }
   if (a === 'delete') {
-    if (!(await ui.confirm(`'${d.name}' 삭제`, `카드 ${countUnder([id])}장이 함께 삭제됩니다.\n되돌릴 수 없습니다.`, '삭제', true))) return;
-    await commit({}, { decks: [id], cards: cardIdsIn([id]) });
+    if (!(await ui.confirm(`'${d.name}' 삭제`, `카드 ${countUnder([id])}장이 함께 삭제됩니다.`, '삭제', true))) return;
+    await deleteWithUndo(`'${d.name}'`, { decks: [id], cards: cardIdsIn([id]) });
     back();
   }
 }
@@ -2433,6 +2574,9 @@ document.addEventListener('click', async e => {
     }
     case 'search': return go('search');
     case 'stats': return go('stats');
+    case 'storage': storageInfo = null; return go('storage');
+    case 'gc-media': return gcMedia();
+    case 'persist': return askPersist();
     case 'nag-later': store.set('backupSnooze', Date.now()); return render();
     case 'export-deck': return exportDeck(id);
     case 'type-submit': return submitTyped();

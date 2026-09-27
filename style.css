@@ -780,3 +780,22 @@ mark { background: color-mix(in srgb, var(--accent) 22%, transparent); color: in
 .tl u.bad { text-decoration: line-through; color: var(--again-fg); opacity: .8; }
 .tl u.miss { text-decoration: none; font-weight: 800; color: var(--good-fg); background: color-mix(in srgb, var(--good-fg) 16%, transparent); border-radius: 3px; }
 .ans.suggest { outline: 2.5px solid currentColor; outline-offset: -2px; }
+
+/* ── 토스트 되돌리기 버튼 ── */
+#toast { display: flex; align-items: center; gap: 12px; justify-content: center; }
+.toast-btn {
+  flex: none;
+  border: 0;
+  background: transparent;
+  color: var(--accent-2);
+  font-weight: 800;
+  font-size: 14px;
+  padding: 2px 2px 2px 0;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+/* ── 저장 공간 ── */
+.use-num { font-size: 26px; font-weight: 800; margin-bottom: 10px; }
+.use-num small { font-size: 14px; font-weight: 600; color: var(--muted); }
+.use-num.tight { color: var(--again-fg); }
