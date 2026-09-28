@@ -553,7 +553,7 @@ window.addEventListener('popstate', e => {
 
 function render() {
   clearTimeout(waitTimer);
-  const views = { home: viewHome, deck: viewDeck, study: viewStudy, browse: viewBrowse, import: viewImport, pairs: viewPairs, search: viewSearch, stats: viewStats, storage: viewStorage, tts: viewTts, listen: viewListen };
+  const views = { home: viewHome, deck: viewDeck, study: viewStudy, browse: viewBrowse, import: viewImport, pairs: viewPairs, search: viewSearch, stats: viewStats, storage: viewStorage, tts: viewTts, listen: viewListen, outline: viewOutline, exam: viewExam };
   app.className = 'view-' + V.name;
   app.innerHTML = (views[V.name] || viewHome)();
   if (V.name !== 'listen') stopListen();
@@ -705,6 +705,8 @@ function viewDeck() {
     <div class="row" style="margin:12px 0">
       <button class="btn" data-act="study" data-scope="${QUIZ}deck:${d.id}">🎯 퀴즈</button>
       <button class="btn" data-act="listen" data-scope="deck:${d.id}">🎧 듣기</button>
+      <button class="btn" data-act="outline" data-scope="deck:${d.id}">📋 목차 훑기</button>
+      <button class="btn" data-act="exam" data-scope="deck:${d.id}">📝 모의 답안</button>
       <button class="btn" data-act="browse" data-id="${d.id}">카드 목록</button>
     </div>
     <button class="btn block" style="margin-bottom:12px" data-act="import-deck" data-id="${d.id}">엑셀로 카드 추가</button>
@@ -715,6 +717,7 @@ function viewDeck() {
       <div class="kv"><span>일시중지</span><span>${t.susp}장</span></div>
       <div class="kv"><span>하루 새 카드</span><span>${examOn ? `${newLimit(d)}장 (시험일 자동)` : `${d.newPerDay ?? CFG.newPerDay}장`}</span></div>
       <div class="kv"><span>시험일</span><span>${d.examDate ? esc(d.examDate) : '설정 안 함'}</span></div>
+      <div class="kv"><span>회독</span><span>${d.rounds || 0}회${d.roundAt ? ` · 마지막 ${fmtDate(d.roundAt)}` : ''}</span></div>
       ${src ? `<div class="kv"><span>앞면 / 뒷면</span><span>${esc(src.front.join(', '))} / ${esc(src.back.join(', '))}</span></div>
       <div class="kv"><span>원본</span><span>${esc(src.file)}${src.sheet ? ' · ' + esc(src.sheet) : ''}</span></div>` : ''}
     </div>
@@ -781,6 +784,8 @@ function pickNext() {
   study.revealed = false;
   study.typed = '';
   study.typedOk = null;
+  study.stage = 0;
+  study.hint = new Set();
   if (study.quiz) {
     study.queue = study.queue.filter(id => S.cards.has(id));
     study.card = S.cards.get(study.queue[0]) || null;
@@ -808,6 +813,232 @@ function fieldsHtml(fields, deck, opts = {}) {
     // 접어 둔 컬럼(예: 핵심·심화)은 탭해서 펼친다
     if (folds.has(f.l)) return `<details class="fold"><summary>${esc(f.l)} 보기</summary><div class="fval">${esc(f.v)}</div></details>`;
     return `<div class="fld">${labels ? `<div class="flabel">${esc(f.l)}</div>` : ''}<div class="fval">${esc(f.v)}</div></div>`;
+  }).join('');
+}
+
+/* ───────────────────────── 모의 답안 연습 ───────────────────────── */
+// 무작위로 뽑은 토픽을 시험지처럼 보여 주고, 타이머를 켠 뒤 종이에 쓰고 나서
+// 두문자 항목으로 스스로 채점한다. 복습 일정에는 반영하지 않는다.
+
+let exam = null;
+function startExam(scope, count, mins) {
+  const pool = outlineCards(scope);
+  exam = {
+    scope,
+    ids: shuffle(pool.map(c => c.id)).slice(0, count),
+    mins,
+    endsAt: Date.now() + mins * MIN,
+    phase: 'write',   // write → grade → done
+    idx: 0,
+    scores: {},
+  };
+  go('exam', { scope });
+}
+function examLeft() { return exam ? exam.endsAt - Date.now() : 0; }
+
+function viewExam() {
+  if (!exam) { queueMicrotask(() => go('home', {}, true)); return ''; }
+  const head = bar('📝 모의 답안', `<button class="icon-btn" data-act="exam-quit" aria-label="끝내기">✕</button>`);
+  const cards = exam.ids.map(id => S.cards.get(id)).filter(Boolean);
+
+  if (exam.phase === 'write') {
+    const over = examLeft() <= 0;
+    return `${head}
+    <main>
+      <div class="exam-timer ${over ? 'over' : ''}">${over ? '시간 종료' : fmtClock(examLeft())}</div>
+      <p class="muted" style="text-align:center;margin:0 0 16px">종이에 답안을 쓰고, 다 쓰면 아래에서 채점으로 넘어가세요.</p>
+      <ol class="exam-list">${cards.map(c => {
+        const deck = S.decks.get(c.deckId);
+        return `<li><b>${esc(firstLine(c.front))}</b><span class="muted">${esc(deck ? deck.name : '')}</span></li>`;
+      }).join('')}</ol>
+      <button class="btn primary block" data-act="exam-grade">채점하기 →</button>
+    </main>`;
+  }
+
+  if (exam.phase === 'grade') {
+    const c = cards[exam.idx];
+    if (!c) { exam.phase = 'done'; return viewExam(); }
+    const deck = S.decks.get(c.deckId) || {};
+    return `${head}
+    <main>
+      <div class="muted" style="text-align:center">${exam.idx + 1} / ${cards.length} 채점</div>
+      <h2 style="text-align:center;margin:6px 0 14px">${esc(firstLine(c.front))}</h2>
+      <section class="panel">${backHtml(c, deck, null)}</section>
+      <p class="muted" style="text-align:center">종이에 쓴 답안과 비교해서 점수를 주세요.</p>
+      <div class="exam-score">
+        ${[['거의 못 씀', 0], ['절반', 1], ['대부분', 2], ['완벽', 3]].map(([l, v]) =>
+          `<button class="btn" data-act="exam-score" data-v="${v}">${l}</button>`).join('')}
+      </div>
+    </main>`;
+  }
+
+  const vals = Object.values(exam.scores);
+  const got = vals.reduce((a, b) => a + b, 0);
+  const max = Math.max(1, vals.length * 3);
+  const pct = Math.round((got / max) * 100);
+  const weak = cards.filter(c => (exam.scores[c.id] ?? 0) <= 1);
+  return `${head}
+  <main>
+    <div class="done">
+      <div class="emoji">${pct >= 80 ? '🏆' : pct >= 50 ? '💪' : '📚'}</div>
+      <h2>${pct}점</h2>
+      <p class="muted">${vals.length}문제 · ${exam.mins}분</p>
+    </div>
+    ${weak.length ? `<section class="panel">
+      <h3>보완할 토픽 ${weak.length}개</h3>
+      ${weak.map(c => `<div class="kv"><span>${esc(firstLine(c.front))}</span><span>${['거의 못 씀', '절반'][exam.scores[c.id] ?? 0] || ''}</span></div>`).join('')}
+    </section>` : ''}
+    <div class="footer-actions" style="margin-top:0">
+      <button class="btn primary" data-act="exam-again">다시 출제</button>
+      <button class="btn" data-act="back">돌아가기</button>
+    </div>
+  </main>`;
+}
+
+async function examMenu(scope) {
+  const n = await ui.menu('📝 모의 답안 연습', [3, 5, 10].map(x => ({ label: `${x}문제`, value: x })));
+  if (!n) return;
+  const m = await ui.menu(`${n}문제 · 시간은?`, [10, 20, 40, 60].map(x => ({ label: `${x}분`, value: x })));
+  if (!m) return;
+  audioInit();
+  startExam(scope, n, m);
+}
+function examScore(v) {
+  const c = S.cards.get(exam.ids[exam.idx]);
+  if (c) exam.scores[c.id] = v;
+  exam.idx++;
+  if (exam.idx >= exam.ids.length) exam.phase = 'done';
+  render();
+}
+
+/* ───────────────────────── 목차 훑기 · 회독 ───────────────────────── */
+// 카드를 한 장씩 넘기지 않고 목록으로 쭉 훑어보는 회독용 화면.
+
+const OUTLINE_PAGE = 25;
+function outlineCards(scope) {
+  const ids = scopeDecks(scope);
+  const rank = new Map(); // 대분류 › 소분류 › 암기장 순서대로 묶어서 보여 준다
+  domainList().forEach(dm => catsOf(dm.id).forEach(ct => decksOf(ct.id).forEach(dk => rank.set(dk.id, rank.size))));
+  const set = new Set(ids);
+  return [...S.cards.values()].filter(c => set.has(c.deckId) && !c.suspended)
+    .sort((a, b) => (rank.get(a.deckId) ?? 0) - (rank.get(b.deckId) ?? 0) || a.order - b.order);
+}
+/** 목차 줄에 함께 보여 줄 두문자(있으면) */
+function outlineHint(card) {
+  const deck = S.decks.get(card.deckId);
+  const f = deck && mnemonicField(card, deck);
+  const blocks = f ? parseMnemonic(f.v) : [];
+  return blocks.map(b => b.letters.join('')).join(' · ');
+}
+
+function viewOutline() {
+  const cards = outlineCards(V.scope);
+  const page = V.page || 0;
+  const shown = cards.slice(0, (page + 1) * OUTLINE_PAGE);
+  const open = new Set(V.open || []);
+  const head = bar(`📋 ${scopeName(V.scope)}`, `<button class="icon-btn" data-act="listen" data-scope="${esc(V.scope)}" aria-label="목차 듣기">🎧</button>`);
+  if (!cards.length) return `${head}<main><div class="empty"><div style="font-size:52px">📋</div><h2>카드가 없어요</h2></div></main>`;
+
+  let lastDeck = '';
+  const rows = shown.map(c => {
+    const deck = S.decks.get(c.deckId);
+    const header = deck && deck.id !== lastDeck ? (lastDeck = deck.id, `<div class="ol-deck">${esc(deck.name)}</div>`) : '';
+    const hint = outlineHint(c);
+    const isOpen = open.has(c.id);
+    return `${header}<div class="ol-row ${isOpen ? 'open' : ''}">
+      <button class="ol-main" data-act="ol-toggle" data-id="${c.id}">
+        <span class="ol-t">${esc(firstLine(c.front))}</span>
+        ${hint ? `<span class="ol-m">${esc(hint)}</span>` : ''}
+      </button>
+      ${isOpen ? `<div class="ol-body">${backHtml(c, deck || {}, null)}</div>` : ''}
+    </div>`;
+  }).join('');
+
+  const rounds = roundsOf(V.scope);
+  return `${head}
+  <main>
+    <div class="ol-head">
+      <span class="muted">${cards.length}개 · ${shown.length}개 표시${rounds ? ` · ${rounds}회독` : ''}</span>
+      <button class="btn small" data-act="ol-all">${open.size ? '모두 접기' : '모두 펼치기'}</button>
+    </div>
+    ${rows}
+    ${shown.length < cards.length
+      ? `<button class="btn block" data-act="ol-more">${Math.min(OUTLINE_PAGE, cards.length - shown.length)}개 더 보기</button>`
+      : `<button class="btn primary block" data-act="ol-done">✓ 회독 완료로 기록</button>`}
+  </main>`;
+}
+
+/** 회독 횟수: 범위 안 암기장들의 최솟값(모두 한 바퀴 돌았는지) */
+function roundsOf(scope) {
+  const ids = scopeDecks(scope);
+  if (!ids.length) return 0;
+  return Math.min(...ids.map(id => (S.decks.get(id) || {}).rounds || 0));
+}
+async function finishRound(scope) {
+  const decks = scopeDecks(scope).map(id => S.decks.get(id)).filter(Boolean)
+    .map(d => ({ ...d, rounds: (d.rounds || 0) + 1, roundAt: Date.now() }));
+  if (!decks.length) return;
+  await commit({ decks });
+  toast(`${roundsOf(scope)}회독 완료로 기록했어요`);
+  render();
+}
+
+/* ───────────────────────── 두문자 ───────────────────────── */
+// "<특성>비복비복변순무\n비가시성, 복잡성, …" 같은 값을 글자와 항목으로 쪼갠다.
+
+function parseMnemonic(value) {
+  const blocks = [];
+  for (const chunk of String(value || '').split(/\n\s*\n/)) {
+    const lines = chunk.split('\n').map(l => l.trim()).filter(Boolean);
+    if (!lines.length) continue;
+    const m = lines[0].match(/^<([^>]*)>\s*(.*)$/);
+    const title = m ? m[1] : '';
+    const head = (m ? m[2] : lines[0]).replace(/\s+/g, '');
+    const letters = [...head].filter(ch => /[가-힣A-Za-z]/.test(ch));
+    const items = lines.slice(1).join(' ').split(/\s*[,·]\s*/).map(x => x.trim()).filter(Boolean);
+    if (letters.length >= 2) blocks.push({ title, letters, items: items.length === letters.length ? items : [] });
+    else if (lines.length) blocks.push({ title, letters: [], items, text: chunk.trim() });
+  }
+  return blocks.filter(b => b.letters.length);
+}
+const mnemonicField = (card, deck) => (deck.mnemonicLabel ? card.back.find(f => f.l === deck.mnemonicLabel && f.v) : null);
+
+/** 앞면에서 "몇 글자인지"만 보여 주고, 탭하면 한 글자씩 열어 본다 */
+function mnemonicHintHtml(card, deck) {
+  const f = mnemonicField(card, deck);
+  if (!f) return '';
+  const blocks = parseMnemonic(f.v);
+  if (!blocks.length) return '';
+  const shown = study.hint || new Set();
+  return `<div class="mnemo-hint">${blocks.map((b, bi) => `<div class="mb">
+    ${b.title ? `<div class="mt">${esc(b.title)} <b>${b.letters.length}</b>개</div>` : `<div class="mt"><b>${b.letters.length}</b>개</div>`}
+    <div class="mrow">${b.letters.map((ch, li) => shown.has(`${bi}:${li}`)
+      ? `<span class="ml on">${esc(ch)}</span>`
+      : `<button class="ml" data-act="mnemo-hint" data-k="${bi}:${li}">○</button>`).join('')}</div>
+  </div>`).join('')}</div>`;
+}
+
+/** 정답에서 두문자를 글자 + 항목 형태로 보여 준다 */
+function mnemonicHtml(f) {
+  const blocks = parseMnemonic(f.v);
+  if (!blocks.length) return '';
+  return `<div class="mnemo">${blocks.map(b => `<div class="mb">
+    ${b.title ? `<div class="mt">${esc(b.title)}</div>` : ''}
+    <div class="mrow">${b.letters.map((ch, i) => `<span class="ml on">${esc(ch)}</span>`).join('')}</div>
+    ${b.items.length ? `<div class="mitems">${b.items.map((it, i) => `<span><b>${esc(b.letters[i] || '')}</b>${esc(it)}</span>`).join('')}</div>` : ''}
+  </div>`).join('')}</div>`;
+}
+
+function backHtml(card, deck, upto) {
+  const fields = card.back;
+  const list = upto == null ? fields : fields.slice(0, upto);
+  if (!list.length) return '';
+  return list.map(f => {
+    if (deck.mnemonicLabel && f.l === deck.mnemonicLabel) {
+      const html = mnemonicHtml(f);
+      if (html) return html;
+    }
+    return fieldsHtml([f], deck);
   }).join('');
 }
 
@@ -853,7 +1084,9 @@ function viewStudy() {
       hint = `<div class="swipe-hint">${s.practice ? '← 몰랐어요 · 알았어요 →' : '← 다시 · 보통 → · ↑ 쉬움 · ↓ 어려움'} 으로 밀어도 돼요</div>`;
     }
   }
-  const typing = !!deck.typeAnswer && !s.practice;
+  const stepCount = c.back.length;
+  const stepping = !!deck.stepReveal && !s.practice && stepCount > 1;
+  const typing = !!deck.typeAnswer && !s.practice && !stepping;
   let typedBlock = '';
   if (typing && s.revealed && s.typed) {
     const best = acceptedAnswers(c)[0] || '';
@@ -886,11 +1119,16 @@ function viewStudy() {
       <div class="swipe-label" aria-hidden="true"></div>
       <div class="inner">
         <div class="front">${fieldsHtml(c.front, deck)}</div>
-        ${s.revealed ? `<hr>${typedBlock}<div class="back">${fieldsHtml(c.back, deck)}</div>` : (typing ? '' : '<div class="tap-hint">탭하면 정답이 보입니다</div>')}
+        ${!s.revealed && s.stage === 0 ? mnemonicHintHtml(c, deck) : ''}
+        ${s.revealed || (stepping && s.stage > 0)
+          ? `<hr>${typedBlock}<div class="back">${backHtml(c, deck, stepping && !s.revealed ? s.stage : null)}</div>`
+          : (typing || stepping ? '' : '<div class="tap-hint">탭하면 정답이 보입니다</div>')}
       </div>
       ${hint}
     </div>
-    ${s.revealed ? buttons : (typing
+    ${s.revealed ? buttons : (stepping
+      ? `<div class="answer-bar one"><button class="btn primary reveal-btn" data-act="step">${s.stage === 0 ? '정답 보기' : `다음 단계 (${s.stage}/${stepCount})`}</button></div>`
+      : typing
       ? `<div class="type-bar">
           <input id="typed" type="text" inputmode="text" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false" enterkeyhint="done" placeholder="정답을 입력하세요" value="${esc(s.typed || '')}">
           <button class="btn primary" data-act="type-submit">확인</button>
@@ -1210,6 +1448,11 @@ function focusPill() {
 }
 function updateFocusPill() {
   document.querySelectorAll('.focus-pill span').forEach(el => { el.textContent = fmtClock(focusLeft()); });
+  const t = document.querySelector('.exam-timer:not(.over)');
+  if (t && exam) {
+    if (examLeft() <= 0) { beep(); render(); }
+    else t.textContent = fmtClock(examLeft());
+  }
 }
 
 let focusBusy = false;
@@ -2579,6 +2822,8 @@ async function menuDomain(id) {
     { label: '💪 약점 카드 연습', value: 'weak' },
     { label: '🎯 객관식 퀴즈', value: 'quiz' },
     { label: '🎧 듣기 모드', value: 'listen' },
+    { label: '📋 목차 훑기', value: 'outline' },
+    { label: '📝 모의 답안 연습', value: 'exam' },
     { label: '이름 변경', value: 'rename' },
     { label: '색상 바꾸기', value: 'color' },
     { label: '삭제', value: 'delete', danger: true },
@@ -2587,6 +2832,8 @@ async function menuDomain(id) {
   if (a === 'weak') { study = null; return go('study', { scope: WEAK + 'dom:' + id }); }
   if (a === 'quiz') { study = null; return go('study', { scope: QUIZ + 'dom:' + id }); }
   if (a === 'listen') return go('listen', { scope: 'dom:' + id });
+  if (a === 'outline') return go('outline', { scope: 'dom:' + id, page: 0, open: [] });
+  if (a === 'exam') return examMenu('dom:' + id);
   if (a === 'color') {
     const r = await modal({
       title: '색상 바꾸기',
@@ -2620,6 +2867,8 @@ async function menuCat(id) {
     { label: '💪 약점 카드 연습', value: 'weak' },
     { label: '🎯 객관식 퀴즈', value: 'quiz' },
     { label: '🎧 듣기 모드', value: 'listen' },
+    { label: '📋 목차 훑기', value: 'outline' },
+    { label: '📝 모의 답안 연습', value: 'exam' },
     { label: '이름 변경', value: 'rename' },
     { label: '다른 대분류로 이동', value: 'move' },
     { label: '삭제', value: 'delete', danger: true },
@@ -2629,6 +2878,8 @@ async function menuCat(id) {
   if (a === 'weak') { study = null; return go('study', { scope: WEAK + 'cat:' + id }); }
   if (a === 'quiz') { study = null; return go('study', { scope: QUIZ + 'cat:' + id }); }
   if (a === 'listen') return go('listen', { scope: 'cat:' + id });
+  if (a === 'outline') return go('outline', { scope: 'cat:' + id, page: 0, open: [] });
+  if (a === 'exam') return examMenu('cat:' + id);
   if (a === 'rename') {
     const name = await ui.prompt('소분류 이름 변경', c.name);
     if (name) { await commit({ categories: [{ ...c, name }] }); render(); }
@@ -2653,6 +2904,9 @@ async function menuDeck(id) {
   const a = await ui.menu(d.name, [
     { label: `📅 시험일 모드 ${d.examDate ? `(${d.examDate})` : '설정'}`, value: 'exam' },
     { label: d.typeAnswer ? '✏️ 주관식 입력 끄기' : '✏️ 주관식 입력 켜기', value: 'typing' },
+    { label: d.stepReveal ? '📖 단계 공개 끄기' : '📖 단계 공개 켜기', value: 'step' },
+    { label: `🔤 두문자 컬럼 ${d.mnemonicLabel ? `(${d.mnemonicLabel})` : '지정'}`, value: 'mnemo' },
+    { label: `🔁 회독 수 (현재 ${d.rounds || 0}회)`, value: 'rounds' },
     { label: '📤 내보내기 (엑셀 · 백업)', value: 'export' },
     { label: '이름 변경', value: 'rename' },
     { label: `하루 새 카드 수 (현재 ${d.newPerDay ?? CFG.newPerDay}장)`, value: 'limit' },
@@ -2663,6 +2917,31 @@ async function menuDeck(id) {
   ]);
   if (a === 'exam') return setExam(id);
   if (a === 'export') return exportDeck(id);
+  if (a === 'rounds') {
+    const v = await ui.prompt('회독 수', String(d.rounds || 0), { type: 'number' });
+    const n = Math.max(0, Math.floor(Number(v)));
+    if (v != null && Number.isFinite(n)) { await commit({ decks: [{ ...d, rounds: n }] }); render(); }
+    return;
+  }
+  if (a === 'step') {
+    await commit({ decks: [{ ...d, stepReveal: !d.stepReveal }] });
+    toast(d.stepReveal ? '정답을 한 번에 보여 줍니다' : '정답을 한 단계씩 보여 줍니다');
+    study = null;
+    return render();
+  }
+  if (a === 'mnemo') {
+    const labels = [...new Set(cardsOf(id).flatMap(c => c.back.filter(f => !f.img && f.v).map(f => f.l)))];
+    if (!labels.length) return toast('뒷면 컬럼이 없어요');
+    const pick = await ui.menu('두문자가 들어 있는 컬럼', [
+      ...labels.map(l => ({ label: l + (d.mnemonicLabel === l ? ' ✓' : ''), value: l })),
+      { label: '사용 안 함', value: '__none' },
+    ]);
+    if (!pick) return;
+    await commit({ decks: [{ ...d, mnemonicLabel: pick === '__none' ? '' : pick }] });
+    toast(pick === '__none' ? '두문자 표시를 껐어요' : `'${pick}' 컬럼을 두문자로 씁니다`);
+    study = null;
+    return render();
+  }
   if (a === 'typing') {
     await commit({ decks: [{ ...d, typeAnswer: !d.typeAnswer }] });
     toast(d.typeAnswer ? '정답을 눌러서 확인해요' : '정답을 직접 입력해서 확인해요');
@@ -2837,6 +3116,17 @@ document.addEventListener('click', async e => {
     case 'quiz-next': return nextQuiz();
     case 'quiz-dir': return toggleQuizDir();
     case 'quiz-again': return restartQuiz(el.dataset.only === 'wrong');
+    case 'step': {
+      const c = study && study.card;
+      if (!c) return;
+      study.stage++;
+      if (study.stage >= c.back.length) { study.revealed = true; study.flip = true; }
+      return render();
+    }
+    case 'mnemo-hint': {
+      study.hint.add(el.dataset.k);
+      return render();
+    }
     case 'reveal':
       if (study && study.card && !study.quiz && !study.revealed) { study.revealed = true; study.flip = true; render(); }
       return;
@@ -2853,6 +3143,30 @@ document.addEventListener('click', async e => {
     case 'search': return go('search');
     case 'stats': return go('stats');
     case 'tts': return go('tts');
+    case 'outline': return go('outline', { scope: el.dataset.scope, page: 0, open: [] });
+    case 'exam': return examMenu(el.dataset.scope);
+    case 'exam-grade': exam.phase = 'grade'; exam.idx = 0; return render();
+    case 'exam-score': return examScore(+el.dataset.v);
+    case 'exam-again': return examMenu(exam.scope);
+    case 'exam-quit': exam = null; return back();
+    case 'ol-toggle': {
+      const open = new Set(V.open || []);
+      open.has(id) ? open.delete(id) : open.add(id);
+      V.open = [...open];
+      history.replaceState({ v: V, depth }, '');
+      return render();
+    }
+    case 'ol-all': {
+      V.open = (V.open || []).length ? [] : outlineCards(V.scope).slice(0, ((V.page || 0) + 1) * OUTLINE_PAGE).map(c => c.id);
+      history.replaceState({ v: V, depth }, '');
+      return render();
+    }
+    case 'ol-more': {
+      V.page = (V.page || 0) + 1;
+      history.replaceState({ v: V, depth }, '');
+      return render();
+    }
+    case 'ol-done': return finishRound(V.scope);
     case 'tts-set': return setTts(el.dataset.k, el.dataset.v);
     case 'tts-test': return speakFields([{ v: '읽어 주기 속도를 확인해 보세요.' }]);
     case 'listen': return go('listen', { scope: el.dataset.scope });

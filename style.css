@@ -869,3 +869,53 @@ details.fold > .fval { font-size: 15px; line-height: 1.6; text-align: left; }
 .listen-opts .chip { min-height: 34px; padding: 4px 12px; font-size: 14px; }
 .listen-note { text-align: center; margin-top: 4px; }
 @media (prefers-reduced-motion: reduce) { .listen-card.playing .eq i { animation: none; height: 10px; } }
+
+/* ── 두문자 ── */
+.mnemo-hint { margin-top: 20px; }
+.mnemo-hint .mb + .mb, .mnemo .mb + .mb { margin-top: 14px; }
+.mt { font-size: 12px; font-weight: 700; color: var(--muted); margin-bottom: 6px; }
+.mt b { color: var(--accent); }
+.mrow { display: flex; flex-wrap: wrap; gap: 6px; justify-content: center; }
+.ml {
+  min-width: 38px;
+  height: 38px;
+  border: 1.5px dashed var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  font-size: 17px;
+  font-weight: 800;
+  color: var(--muted);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 6px;
+}
+.ml.on { border-style: solid; border-color: transparent; background: var(--easy-bg); color: var(--easy-fg); }
+.mitems { display: flex; flex-wrap: wrap; gap: 6px; justify-content: center; margin-top: 8px; }
+.mitems span { font-size: 13px; background: var(--surface-2); border-radius: 99px; padding: 3px 10px; }
+.mitems b { color: var(--accent); margin-right: 4px; }
+.mnemo { margin: 6px 0; }
+
+/* ── 목차 훑기 ── */
+.ol-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 0 2px 12px; }
+.ol-deck { font-size: 13px; font-weight: 800; color: var(--muted); margin: 16px 4px 8px; }
+.ol-row { background: var(--surface); border-radius: 14px; box-shadow: var(--shadow); margin-bottom: 6px; overflow: hidden; }
+.ol-main { display: flex; align-items: baseline; gap: 10px; width: 100%; text-align: left; border: 0; background: transparent; padding: 12px 14px; min-height: 46px; }
+.ol-t { flex: 1; min-width: 0; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ol-m { flex: none; font-size: 12.5px; font-weight: 700; color: var(--accent); background: var(--surface-2); border-radius: 99px; padding: 2px 9px; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ol-row.open { box-shadow: var(--shadow-lg); }
+.ol-row.open .ol-t { white-space: normal; }
+.ol-body { padding: 0 14px 14px; text-align: left; }
+.ol-body .fval { font-size: 14.5px; line-height: 1.6; }
+.ol-body .flabel { margin-top: 8px; }
+.ol-body .mrow { justify-content: flex-start; }
+.ol-body .mitems { justify-content: flex-start; }
+
+/* ── 모의 답안 연습 ── */
+.exam-timer { text-align: center; font-size: 44px; font-weight: 800; font-variant-numeric: tabular-nums; margin: 10px 0 4px; }
+.exam-timer.over { color: var(--again-fg); font-size: 28px; }
+.exam-list { margin: 0 0 20px; padding-left: 22px; }
+.exam-list li { background: var(--surface); border-radius: 14px; box-shadow: var(--shadow); padding: 12px 14px; margin-bottom: 8px; }
+.exam-list li b { display: block; font-size: 17px; }
+.exam-list li span { font-size: 12px; }
+.exam-score { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 12px; }
