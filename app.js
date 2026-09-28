@@ -793,12 +793,16 @@ function pickNext() {
   study.card = study.q.next;
 }
 
-function fieldsHtml(fields, deck) {
+function fieldsHtml(fields, deck, opts = {}) {
   if (!fields || !fields.length) return '<div class="muted">(비어 있음)</div>';
   const labels = deck.showLabels !== false && fields.filter(f => !f.img).length > 1;
-  return fields.map(f => f.img
-    ? `<div class="fld"><img class="card-img" data-media="${esc(f.img)}" alt="카드 사진">${f.v ? `<div class="fval cap">${esc(f.v)}</div>` : ''}</div>`
-    : `<div class="fld">${labels ? `<div class="flabel">${esc(f.l)}</div>` : ''}<div class="fval">${esc(f.v)}</div></div>`).join('');
+  const folds = new Set(opts.fold === false ? [] : (deck.foldLabels || []));
+  return fields.map(f => {
+    if (f.img) return `<div class="fld"><img class="card-img" data-media="${esc(f.img)}" alt="카드 사진">${f.v ? `<div class="fval cap">${esc(f.v)}</div>` : ''}</div>`;
+    // 접어 둔 컬럼(예: 핵심·심화)은 탭해서 펼친다
+    if (folds.has(f.l)) return `<details class="fold"><summary>${esc(f.l)} 보기</summary><div class="fval">${esc(f.v)}</div></details>`;
+    return `<div class="fld">${labels ? `<div class="flabel">${esc(f.l)}</div>` : ''}<div class="fval">${esc(f.v)}</div></div>`;
+  }).join('');
 }
 
 function viewStudy() {
@@ -1745,7 +1749,7 @@ function bindSwipe() {
   };
 
   el.addEventListener('pointerdown', e => {
-    if (!study.revealed || e.target.closest('button') || e.button > 0) return;
+    if (!study.revealed || e.target.closest('button, summary, details') || e.button > 0) return;
     pid = e.pointerId; sx = e.clientX; sy = e.clientY; dx = dy = 0; axis = null;
   });
   el.addEventListener('pointermove', e => {
@@ -2073,10 +2077,18 @@ function resetCard(c) {
 /* ───────────────────────── 엑셀 가져오기 ───────────────────────── */
 
 let imp = null;
-const NEW = '__new';
+const NEW = '__new', SPLIT = '__split';
+
+/** '이 컬럼으로 나누면 몇 개가 생기는지' 안내 문구 */
+function splitInfo(col, what) {
+  if (col == null || !imp.rows) return '';
+  const names = new Set(imp.rows.map(r => cell(r, col).trim() || '기타'));
+  const sample = [...names].slice(0, 3).join(', ');
+  return `${what} ${names.size}개가 만들어져요 · ${esc(sample)}${names.size > 3 ? ' …' : ''}`;
+}
 
 function startImport(dest = {}) {
-  imp = { header: true, reverse: false, front: new Set([0]), back: new Set([1]), domainId: null, catId: null, deckId: NEW, ...dest };
+  imp = { header: true, reverse: false, front: new Set([0]), back: new Set([1]), fold: new Set(), catCol: 0, deckCol: 0, domainId: null, catId: null, deckId: NEW, ...dest };
   if (!imp.domainId) imp.domainId = domainList()[0]?.id || NEW;
   if (!imp.catId) imp.catId = imp.domainId === NEW ? NEW : (catsOf(imp.domainId)[0]?.id || NEW);
   go('import');
@@ -2162,15 +2174,19 @@ function viewImport() {
   const front = [...imp.front].sort((a, b) => a - b), back = [...imp.back].sort((a, b) => a - b);
   const sample = imp.rows.find(r => rowFields(r, front).length) || [];
   const pDeck = { showLabels: true };
+  const foldSec = back.length ? `<div class="side-label" style="margin-top:12px">접어 둘 컬럼 — 정답을 본 뒤 탭해서 펼쳐 봐요</div>
+    <div class="chips">${back.map(i => `<button class="chip ${imp.fold.has(i) ? 'on' : ''}" data-act="imp-fold" data-i="${i}">${esc(imp.cols[i])}</button>`).join('')}</div>` : '';
+  const pDeckFold = { showLabels: true, foldLabels: [...imp.fold].map(i => imp.cols[i]) };
   const colSec = `<section class="panel">
     <h3>2. 컬럼 선택</h3>
     <div class="side-label">앞면(질문) — 여러 개 선택 가능</div>${chips('front')}
     <div class="side-label">뒷면(정답) — 여러 개 선택 가능</div>${chips('back')}
+    ${foldSec}
     <label class="check"><input type="checkbox" id="imp-reverse" ${imp.reverse ? 'checked' : ''}> 앞뒤를 바꾼 카드도 함께 만들기</label>
     <div class="side-label" style="margin-top:12px">미리보기</div>
     <div class="preview-card">
-      <div class="front">${fieldsHtml(rowFields(sample, front), pDeck)}</div><hr>
-      <div class="back">${fieldsHtml(rowFields(sample, back), pDeck)}</div>
+      <div class="front">${fieldsHtml(rowFields(sample, front), pDeckFold)}</div><hr>
+      <div class="back">${fieldsHtml(rowFields(sample, back), pDeckFold)}</div>
     </div>
   </section>`;
 
@@ -2185,13 +2201,17 @@ function viewImport() {
       ${imp.domainId === NEW ? `<input type="text" class="sub-input" id="imp-dom-name" placeholder="새 대분류 이름 (예: 어학)" value="${esc(imp.domName || '')}">` : ''}
     </label>
     <label class="field"><span>소분류</span>
-      <select id="imp-cat">${cats.map(c => opt(c.id, c.name, imp.catId)).join('')}${opt(NEW, '＋ 새 소분류 만들기', imp.catId)}</select>
+      <select id="imp-cat">${cats.map(c => opt(c.id, c.name, imp.catId)).join('')}${opt(NEW, '＋ 새 소분류 만들기', imp.catId)}${opt(SPLIT, '🗂 컬럼 값으로 나누기', imp.catId)}</select>
       ${imp.catId === NEW ? `<input type="text" class="sub-input" id="imp-cat-name" placeholder="새 소분류 이름 (예: 영어 단어)" value="${esc(imp.catName || '')}">` : ''}
+      ${imp.catId === SPLIT ? `<select class="sub-input" id="imp-cat-col">${imp.cols.map((c, i) => opt(String(i), `${c} 컬럼으로 나누기`, String(imp.catCol))).join('')}</select>
+        <p class="muted" style="margin:6px 0 0">${splitInfo(imp.catCol, '소분류')}</p>` : ''}
     </label>
     <label class="field"><span>암기장</span>
-      <select id="imp-deck">${opt(NEW, '＋ 새 암기장 만들기', imp.deckId)}${decks.map(d => opt(d.id, `${d.name} (기존에 추가)`, imp.deckId)).join('')}</select>
-      ${imp.deckId === NEW ? `<input type="text" class="sub-input" id="imp-deck-name" placeholder="암기장 이름" value="${esc(imp.deckName || '')}">`
-        : `<p class="muted" style="margin:6px 0 0">앞면이 같은 카드는 학습 기록을 유지한 채 뒷면만 갱신하고, 새 행만 추가합니다.</p>`}
+      <select id="imp-deck">${opt(NEW, '＋ 새 암기장 만들기', imp.deckId)}${decks.map(d => opt(d.id, `${d.name} (기존에 추가)`, imp.deckId)).join('')}${opt(SPLIT, '🗂 컬럼 값으로 나누기', imp.deckId)}</select>
+      ${imp.deckId === NEW ? `<input type="text" class="sub-input" id="imp-deck-name" placeholder="암기장 이름" value="${esc(imp.deckName || '')}">` : ''}
+      ${imp.deckId === SPLIT ? `<select class="sub-input" id="imp-deck-col">${imp.cols.map((c, i) => opt(String(i), `${c} 컬럼으로 나누기`, String(imp.deckCol))).join('')}</select>
+        <p class="muted" style="margin:6px 0 0">${splitInfo(imp.deckCol, '암기장')}</p>` : ''}
+      ${imp.deckId !== NEW && imp.deckId !== SPLIT ? `<p class="muted" style="margin:6px 0 0">앞면이 같은 카드는 학습 기록을 유지한 채 뒷면만 갱신하고, 새 행만 추가합니다.</p>` : ''}
     </label>
   </section>`;
 
@@ -2203,70 +2223,118 @@ async function runImport() {
   const front = [...imp.front].sort((a, b) => a - b), back = [...imp.back].sort((a, b) => a - b);
   if (!front.length) return toast('앞면 컬럼을 하나 이상 선택하세요');
   if (!back.length) return toast('뒷면 컬럼을 하나 이상 선택하세요');
+  if (imp.catId === SPLIT && imp.catCol == null) return toast('소분류로 나눌 컬럼을 고르세요');
+  if (imp.deckId === SPLIT && imp.deckCol == null) return toast('암기장으로 나눌 컬럼을 고르세요');
 
   const now = Date.now();
   const put = { domains: [], categories: [], decks: [], cards: [] };
-  let dom, cat, deck;
+
+  let dom;
   if (imp.domainId === NEW) {
     const name = (imp.domName || '').trim();
     if (!name) return toast('새 대분류 이름을 입력하세요');
     dom = { id: uid(), name, created: now };
     put.domains.push(dom);
   } else dom = S.domains.get(imp.domainId);
+
+  const foldLabels = back.filter(i => imp.fold.has(i)).map(i => imp.cols[i]);
+  const source = {
+    file: imp.fileName,
+    sheet: imp.wb.SheetNames.length > 1 ? imp.sheet : '',
+    front: front.map(i => imp.cols[i]),
+    back: back.map(i => imp.cols[i]),
+  };
+
+  // 소분류: 고정 또는 컬럼 값마다 하나씩
+  const catCache = new Map();
+  const ensureCat = raw => {
+    const name = (raw || '').trim() || '기타';
+    if (catCache.has(name)) return catCache.get(name);
+    let c = catsOf(dom.id).find(x => x.name === name) || put.categories.find(x => x.domainId === dom.id && x.name === name);
+    if (!c) { c = { id: uid(), domainId: dom.id, name, created: now }; put.categories.push(c); }
+    catCache.set(name, c);
+    return c;
+  };
+  let fixedCat = null;
   if (imp.catId === NEW) {
     const name = (imp.catName || '').trim();
     if (!name) return toast('새 소분류 이름을 입력하세요');
-    cat = { id: uid(), domainId: dom.id, name, created: now };
-    put.categories.push(cat);
-  } else cat = S.categories.get(imp.catId);
-  const source = { file: imp.fileName, sheet: imp.wb.SheetNames.length > 1 ? imp.sheet : '', front: front.map(i => imp.cols[i]), back: back.map(i => imp.cols[i]) };
-  if (imp.deckId === NEW) {
-    const name = (imp.deckName || '').trim();
-    if (!name) return toast('암기장 이름을 입력하세요');
-    deck = { id: uid(), catId: cat.id, name, newPerDay: CFG.newPerDay, showLabels: true, newDate: '', newCount: 0, created: now, source };
-  } else deck = { ...S.decks.get(imp.deckId), source };
-  put.decks.push(deck);
+    fixedCat = ensureCat(name);
+  } else if (imp.catId !== SPLIT) fixedCat = S.categories.get(imp.catId);
 
-  const existing = new Map(cardsOf(deck.id).map(c => [c.key, c]));
-  let order = cardsOf(deck.id).reduce((m, c) => Math.max(m, c.order + 1), 0);
+  // 암기장: 고정 또는 컬럼 값마다 하나씩. 기존 암기장이면 카드·순서를 이어 쓴다.
+  const deckState = new Map();
+  const useDeck = deck => {
+    if (!deckState.has(deck.id)) {
+      const cards = cardsOf(deck.id);
+      deckState.set(deck.id, {
+        deck,
+        existing: new Map(cards.map(c => [c.key, c])),
+        order: cards.reduce((m, c) => Math.max(m, c.order + 1), 0),
+        isNew: !S.decks.has(deck.id),
+      });
+      put.decks.push(deck);
+    }
+    return deckState.get(deck.id);
+  };
+  const ensureDeck = (cat, raw) => {
+    const name = (raw || '').trim() || '기타';
+    for (const st of deckState.values()) if (st.deck.catId === cat.id && st.deck.name === name) return st;
+    const found = decksOf(cat.id).find(x => x.name === name);
+    return useDeck(found
+      ? { ...found, source, foldLabels }
+      : { id: uid(), catId: cat.id, name, newPerDay: CFG.newPerDay, showLabels: true, foldLabels, newDate: '', newCount: 0, created: now, source });
+  };
+  if (imp.deckId === NEW && !(imp.deckName || '').trim()) return toast('암기장 이름을 입력하세요');
+
   let added = 0, updated = 0, same = 0, empty = 0;
   const changed = new Map();
-  const add = (f, b, key) => {
-    const ex = existing.get(key);
+  const add = (st, f, b, key) => {
+    const ex = st.existing.get(key);
     if (ex) {
       // 앱에서 붙인 사진과 메모는 엑셀에 없으니 그대로 둔다
       f = f.concat(ex.front.filter(x => x.img));
       b = b.concat(ex.back.filter(x => x.img || x.l === MEMO));
       if (JSON.stringify(ex.back) !== JSON.stringify(b) || JSON.stringify(ex.front) !== JSON.stringify(f)) {
         const u = { ...ex, front: f, back: b };
-        existing.set(key, u);
+        st.existing.set(key, u);
         if (!changed.has(u.id)) updated++;
         changed.set(u.id, u);
       } else same++;
       return;
     }
-    const c = { id: uid(), deckId: deck.id, front: f, back: b, key, order: order++, state: 'new', step: 0, due: 0, ivl: 0, ease: CFG.startEase, reps: 0, lapses: 0, created: now };
-    existing.set(key, c);
+    const c = { id: uid(), deckId: st.deck.id, front: f, back: b, key, order: st.order++, state: 'new', step: 0, due: 0, ivl: 0, ease: CFG.startEase, reps: 0, lapses: 0, created: now };
+    st.existing.set(key, c);
     changed.set(c.id, c);
     added++;
   };
+
   for (const row of imp.rows) {
+    const cat = imp.catId === SPLIT ? ensureCat(cell(row, imp.catCol)) : fixedCat;
+    const st = imp.deckId === SPLIT ? ensureDeck(cat, cell(row, imp.deckCol))
+      : imp.deckId === NEW ? ensureDeck(cat, imp.deckName)
+        : useDeck({ ...S.decks.get(imp.deckId), source, foldLabels });
     const f = rowFields(row, front), b = rowFields(row, back);
     if (!f.length) { empty++; continue; }
-    add(f, b, keyOf(f));
-    if (imp.reverse && b.length) add(b, f, 'R␞' + keyOf(b));
+    add(st, f, b, keyOf(f));
+    if (imp.reverse && b.length) add(st, b, f, 'R␞' + keyOf(b));
   }
   put.cards = [...changed.values()];
+  const newDecks = [...deckState.values()].filter(st => st.isNew).length;
+  const onlyDeck = deckState.size === 1 ? [...deckState.values()][0].deck : null;
 
   await commit(put);
   requestPersist();
   imp = null;
   const lines = [`새 카드 ${added}장을 추가했습니다.`];
+  if (put.categories.length) lines.push(`소분류 ${put.categories.length}개를 만들었습니다.`);
+  if (newDecks) lines.push(`암기장 ${newDecks}개를 만들었습니다.`);
   if (updated) lines.push(`기존 카드 ${updated}장의 내용을 갱신했습니다.`);
   if (same) lines.push(`변경 없는 카드 ${same}장은 그대로 두었습니다.`);
   if (empty) lines.push(`앞면이 빈 ${empty}행은 건너뛰었습니다.`);
-  go('deck', { id: deck.id }, true);
-  ui.alert('가져오기 완료', lines.join('\n'));
+  if (onlyDeck) go('deck', { id: onlyDeck.id }, true);
+  else go('home', {}, true);
+  ui.alert('가져오기 완료', lines.join(String.fromCharCode(10)));
 }
 
 /* ───────────────────────── 메뉴 동작 ───────────────────────── */
@@ -2599,6 +2667,11 @@ document.addEventListener('click', async e => {
       if (await editCard(blank, true)) $('#list').innerHTML = browseList();
       return;
     }
+    case 'imp-fold': {
+      const k = +el.dataset.i;
+      imp.fold.has(k) ? imp.fold.delete(k) : imp.fold.add(k);
+      return render();
+    }
     case 'imp-col': {
       const set = imp[el.dataset.side], i = +el.dataset.i;
       set.has(i) ? set.delete(i) : set.add(i);
@@ -2621,6 +2694,8 @@ document.addEventListener('change', e => {
       imp.deckId = NEW;
       return render();
     case 'imp-cat': imp.catId = t.value; imp.deckId = NEW; return render();
+    case 'imp-cat-col': imp.catCol = +t.value; return render();
+    case 'imp-deck-col': imp.deckCol = +t.value; return render();
     case 'imp-deck': imp.deckId = t.value; return render();
     case 'restore-file': if (t.files[0]) restore(t.files[0]); t.value = ''; return;
   }

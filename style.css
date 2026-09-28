@@ -799,3 +799,25 @@ mark { background: color-mix(in srgb, var(--accent) 22%, transparent); color: in
 .use-num { font-size: 26px; font-weight: 800; margin-bottom: 10px; }
 .use-num small { font-size: 14px; font-weight: 600; color: var(--muted); }
 .use-num.tight { color: var(--again-fg); }
+
+/* ── 접어 둔 카드 내용(핵심·심화 등) ── */
+details.fold { margin-top: 12px; text-align: left; }
+details.fold > summary {
+  list-style: none;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--accent);
+  background: var(--surface-2);
+  border-radius: 99px;
+  padding: 6px 14px;
+}
+details.fold > summary::-webkit-details-marker { display: none; }
+details.fold > summary::before { content: '＋'; font-weight: 800; }
+details.fold[open] > summary::before { content: '－'; }
+details.fold[open] > summary { margin-bottom: 8px; }
+details.fold > .fval { font-size: 15px; line-height: 1.6; text-align: left; }
+.preview-card details.fold > .fval { font-size: 13px; }
