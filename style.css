@@ -578,29 +578,6 @@ input[type=date] {
 }
 .speak-btn:active { transform: scale(.92); }
 .deck-tag { max-width: calc(100% - 120px); }
-.study-card.dragging { transition: none; animation: none; user-select: none; -webkit-user-select: none; }
-.study-card.fly { transition: transform .18s ease-in, opacity .18s ease-in; opacity: 0; }
-.swipe-label {
-  position: absolute;
-  top: 64px;
-  left: 50%;
-  transform: translateX(-50%);
-  padding: 6px 18px;
-  border-radius: 99px;
-  font-weight: 900;
-  font-size: 18px;
-  opacity: 0;
-  pointer-events: none;
-  z-index: 3;
-  background: var(--c-bg, transparent);
-  color: var(--c-fg, transparent);
-  box-shadow: 0 6px 18px -8px rgba(0, 0, 0, .3);
-}
-.swipe-label.a1 { --c-bg: var(--again-bg); --c-fg: var(--again-fg); }
-.swipe-label.a2 { --c-bg: var(--hard-bg); --c-fg: var(--hard-fg); }
-.swipe-label.a3 { --c-bg: var(--good-bg); --c-fg: var(--good-fg); }
-.swipe-label.a4 { --c-bg: var(--easy-bg); --c-fg: var(--easy-fg); }
-.swipe-hint { flex: none; margin-top: 18px; font-size: 12px; font-weight: 600; color: var(--muted); }
 .answer-bar.two { grid-template-columns: 1fr 1fr; }
 
 /* ── 객관식 퀴즈 ── */

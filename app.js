@@ -558,7 +558,6 @@ function render() {
   app.innerHTML = (views[V.name] || viewHome)();
   if (V.name !== 'listen') stopListen();
   if (V.name === 'study') {
-    bindSwipe();
     autoSpeak();
     const t = $('#typed');
     if (t) t.focus(); // 주관식 모드에서는 바로 입력할 수 있게
@@ -1029,7 +1028,7 @@ function mnemonicHtml(f) {
   </div>`).join('')}</div>`;
 }
 
-function backHtml(card, deck, upto) {
+function backHtml(card, deck, upto, opts = {}) {
   const fields = card.back;
   const list = upto == null ? fields : fields.slice(0, upto);
   if (!list.length) return '';
@@ -1038,7 +1037,7 @@ function backHtml(card, deck, upto) {
       const html = mnemonicHtml(f);
       if (html) return html;
     }
-    return fieldsHtml([f], deck);
+    return fieldsHtml([f], deck, opts);
   }).join('');
 }
 
@@ -1075,15 +1074,6 @@ function viewStudy() {
   const flip = !enter && s.flip;
   s.animId = c.id;
   s.flip = false;
-  // 처음 몇 번만 스와이프 사용법을 보여 준다
-  let hint = '';
-  if (s.revealed) {
-    const seen = store.get('swipeHint', 0);
-    if (seen < 8) {
-      if (flip) store.set('swipeHint', seen + 1);
-      hint = `<div class="swipe-hint">${s.practice ? '← 몰랐어요 · 알았어요 →' : '← 다시 · 보통 → · ↑ 쉬움 · ↓ 어려움'} 으로 밀어도 돼요</div>`;
-    }
-  }
   const stepCount = c.back.length;
   const stepping = !!deck.stepReveal && !s.practice && stepCount > 1;
   const typing = !!deck.typeAnswer && !s.practice && !stepping;
@@ -1116,15 +1106,13 @@ function viewStudy() {
     <div class="study-card ${enter ? 'enter' : ''} ${flip ? 'flip' : ''}" data-act="reveal">
       <div class="deck-tag">${esc(deck.name)}</div>
       ${tts.ok ? '<button class="speak-btn" data-act="speak" aria-label="읽어 주기">🔊</button>' : ''}
-      <div class="swipe-label" aria-hidden="true"></div>
       <div class="inner">
         <div class="front">${fieldsHtml(c.front, deck)}</div>
         ${!s.revealed && s.stage === 0 ? mnemonicHintHtml(c, deck) : ''}
         ${s.revealed || (stepping && s.stage > 0)
-          ? `<hr>${typedBlock}<div class="back">${backHtml(c, deck, stepping && !s.revealed ? s.stage : null)}</div>`
+          ? `<hr>${typedBlock}<div class="back">${backHtml(c, deck, stepping && !s.revealed ? s.stage : null, { fold: !stepping })}</div>`
           : (typing || stepping ? '' : '<div class="tap-hint">탭하면 정답이 보입니다</div>')}
       </div>
-      ${hint}
     </div>
     ${s.revealed ? buttons : (stepping
       ? `<div class="answer-bar one"><button class="btn primary reveal-btn" data-act="step">${s.stage === 0 ? '정답 보기' : `다음 단계 (${s.stage}/${stepCount})`}</button></div>`
@@ -1136,6 +1124,24 @@ function viewStudy() {
         <div class="type-skip"><button class="link" data-act="type-skip">모르겠어요 · 정답 보기</button></div>`
       : `<div class="answer-bar one"><button class="btn primary reveal-btn" data-act="reveal">정답 보기</button></div>`)}
   </main>`;
+}
+
+/** 단계 공개가 켜져 있으면 한 단계씩, 아니면 정답 전체를 연다 */
+function isStepping(card) {
+  const deck = S.decks.get(card.deckId);
+  return !!(deck && deck.stepReveal) && !study.practice && card.back.length > 1;
+}
+function revealStep() {
+  const c = study && study.card;
+  if (!c || study.revealed) return;
+  if (isStepping(c)) {
+    study.stage++;
+    if (study.stage >= c.back.length) { study.revealed = true; study.flip = true; }
+  } else {
+    study.revealed = true;
+    study.flip = true;
+  }
+  render();
 }
 
 async function answer(r) {
@@ -1971,75 +1977,6 @@ function weakHtml(scope) {
 function examChip(deck) {
   const ex = examInfo(deck);
   return ex && !ex.past ? `<span class="exam-chip">${ex.days ? `D-${ex.days}` : 'D-DAY'}</span>` : '';
-}
-
-/* ───────────────────────── 스와이프 평가 ───────────────────────── */
-// 정답을 연 뒤 카드를 밀어서 평가: ← 다시, → 보통, ↑ 쉬움, ↓ 어려움 (약점 연습은 좌우만)
-
-function bindSwipe() {
-  const el = $('.study-card');
-  if (!el || !study || !study.card) return;
-  const label = el.querySelector('.swipe-label');
-  const canVertical = () => !study.practice && el.scrollHeight <= el.clientHeight + 2;
-  el.style.touchAction = canVertical() ? 'none' : 'pan-y';
-  const MAP = study.practice
-    ? { left: [1, '몰랐어요', 'a1'], right: [3, '알았어요', 'a3'] }
-    : { left: [1, '다시', 'a1'], right: [3, '보통', 'a3'], up: [4, '쉬움', 'a4'], down: [2, '어려움', 'a2'] };
-  const TH = 80;
-  let sx = 0, sy = 0, dx = 0, dy = 0, axis = null, pid = null;
-
-  const dirOf = () => axis === 'x' ? (dx < 0 ? 'left' : 'right') : (dy < 0 ? 'up' : 'down');
-  const reset = () => {
-    el.classList.remove('dragging');
-    el.style.transform = '';
-    label.className = 'swipe-label';
-    axis = null;
-    pid = null;
-  };
-
-  el.addEventListener('pointerdown', e => {
-    if (!study.revealed || e.target.closest('button, summary, details') || e.button > 0) return;
-    pid = e.pointerId; sx = e.clientX; sy = e.clientY; dx = dy = 0; axis = null;
-  });
-  el.addEventListener('pointermove', e => {
-    if (e.pointerId !== pid) return;
-    dx = e.clientX - sx; dy = e.clientY - sy;
-    if (!axis) {
-      if (Math.hypot(dx, dy) < 10) return;
-      axis = Math.abs(dx) >= Math.abs(dy) ? 'x' : (canVertical() ? 'y' : null);
-      if (!axis) { pid = null; return; }       // 세로 스크롤에 양보
-      try { el.setPointerCapture(pid); } catch { /* 무시 */ }
-      el.classList.add('dragging');
-    }
-    const tx = axis === 'x' ? dx : 0, ty = axis === 'y' ? dy : 0;
-    el.style.transform = `translate(${tx}px, ${ty}px) rotate(${tx / 18}deg)`;
-    const m = MAP[dirOf()];
-    const dist = Math.abs(axis === 'x' ? dx : dy);
-    label.textContent = m ? m[1] : '';
-    label.className = `swipe-label ${m ? m[2] : ''}`;
-    label.style.opacity = m ? Math.min(1, dist / TH) : 0;
-  });
-  const end = e => {
-    if (e.pointerId !== pid) return;
-    if (!axis) { pid = null; return; }
-    const m = MAP[dirOf()];
-    const dist = Math.abs(axis === 'x' ? dx : dy);
-    study.suppressClick = true;
-    setTimeout(() => { if (study) study.suppressClick = false; }, 350);
-    if (m && dist >= TH) {
-      el.classList.remove('dragging');
-      el.classList.add('fly');
-      const k = 5;
-      el.style.transform = `translate(${axis === 'x' ? dx * k : 0}px, ${axis === 'y' ? dy * k : 0}px) rotate(${axis === 'x' ? dx / 6 : 0}deg)`;
-      pid = null;
-      setTimeout(() => answer(m[0]), 170);
-    } else {
-      el.classList.remove('dragging');
-      reset();
-    }
-  };
-  el.addEventListener('pointerup', end);
-  el.addEventListener('pointercancel', e => { if (e.pointerId === pid) reset(); });
 }
 
 /* ───────────────────────── 음성 읽기 ───────────────────────── */
@@ -3090,7 +3027,6 @@ async function restore(file) {
 document.addEventListener('click', async e => {
   const el = e.target.closest('[data-act]');
   if (!el || el.closest('.overlay') || el.disabled) return;
-  if (study && study.suppressClick && el.closest('.study-card')) return; // 스와이프 직후의 클릭 무시
   const act = el.dataset.act, id = el.dataset.id;
   switch (act) {
     case 'speak': return speakCurrent();
@@ -3116,19 +3052,13 @@ document.addEventListener('click', async e => {
     case 'quiz-next': return nextQuiz();
     case 'quiz-dir': return toggleQuizDir();
     case 'quiz-again': return restartQuiz(el.dataset.only === 'wrong');
-    case 'step': {
-      const c = study && study.card;
-      if (!c) return;
-      study.stage++;
-      if (study.stage >= c.back.length) { study.revealed = true; study.flip = true; }
-      return render();
-    }
+    case 'step': return revealStep();
     case 'mnemo-hint': {
       study.hint.add(el.dataset.k);
       return render();
     }
     case 'reveal':
-      if (study && study.card && !study.quiz && !study.revealed) { study.revealed = true; study.flip = true; render(); }
+      if (study && study.card && !study.quiz && !study.revealed) revealStep();
       return;
     case 'ans': return answer(+el.dataset.r);
     case 'undo': return undo();
@@ -3262,7 +3192,7 @@ document.addEventListener('keydown', e => {
   if (e.key === ' ' || e.key === 'Enter') {
     e.preventDefault();
     if (!study.card) return;
-    if (!study.revealed) { study.revealed = true; study.flip = true; render(); } else answer(3);
+    if (!study.revealed) revealStep(); else answer(3);
   } else if (/^[1-4]$/.test(e.key) && study.revealed) answer(+e.key);
   else if (e.key === 'z' || e.key === 'Z') undo();
 });
