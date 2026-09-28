@@ -553,11 +553,13 @@ window.addEventListener('popstate', e => {
 
 function render() {
   clearTimeout(waitTimer);
-  const views = { home: viewHome, deck: viewDeck, study: viewStudy, browse: viewBrowse, import: viewImport, pairs: viewPairs, search: viewSearch, stats: viewStats, storage: viewStorage };
+  const views = { home: viewHome, deck: viewDeck, study: viewStudy, browse: viewBrowse, import: viewImport, pairs: viewPairs, search: viewSearch, stats: viewStats, storage: viewStorage, tts: viewTts, listen: viewListen };
   app.className = 'view-' + V.name;
   app.innerHTML = (views[V.name] || viewHome)();
+  if (V.name !== 'listen') stopListen();
   if (V.name === 'study') {
     bindSwipe();
+    autoSpeak();
     const t = $('#typed');
     if (t) t.focus(); // 주관식 모드에서는 바로 입력할 수 있게
   }
@@ -611,6 +613,7 @@ function viewHome() {
             ? `<button class="btn" data-act="study" data-scope="all">▶ 학습 시작</button>`
             : `<div class="done-msg">내일 또 만나요 👋</div>`}
           <button class="btn quiz-btn" data-act="study" data-scope="${QUIZ}all" aria-label="객관식 퀴즈">🎯</button>
+          <button class="btn quiz-btn" data-act="listen" data-scope="all" aria-label="듣기 모드">🎧</button>
         </div>
       </section>
       ${backupNagHtml()}
@@ -634,6 +637,7 @@ function viewHome() {
           <button class="btn" data-act="backup">백업 내보내기</button>
           <label class="btn file-btn" style="flex:1">백업 복원<input type="file" id="restore-file" accept=".json,application/json"></label>
         </div>
+        <button class="btn" data-act="tts">🔊 읽어 주기 설정</button>
         <button class="btn" data-act="storage">저장 공간 관리</button>
       </div>
       <div class="version muted">암기장 v${APP_VERSION} · 데이터는 이 기기에만 저장됩니다</div>
@@ -699,7 +703,8 @@ function viewDeck() {
       ? `<button class="btn primary block reveal-btn" data-act="study" data-scope="deck:${d.id}">학습 시작</button>`
       : `<div class="panel" style="text-align:center">🎉 오늘 이 암기장의 학습을 모두 마쳤습니다.</div>`}
     <div class="row" style="margin:12px 0">
-      <button class="btn" data-act="study" data-scope="${QUIZ}deck:${d.id}">🎯 객관식 퀴즈</button>
+      <button class="btn" data-act="study" data-scope="${QUIZ}deck:${d.id}">🎯 퀴즈</button>
+      <button class="btn" data-act="listen" data-scope="deck:${d.id}">🎧 듣기</button>
       <button class="btn" data-act="browse" data-id="${d.id}">카드 목록</button>
     </div>
     <button class="btn block" style="margin-bottom:12px" data-act="import-deck" data-id="${d.id}">엑셀로 카드 추가</button>
@@ -753,7 +758,8 @@ function buildQueue(s, now = Date.now()) {
     if (learnLater[0].due <= now + CFG.learnAhead) next = learnLater[0];
     else waitUntil = learnLater[0].due;
   }
-  return { next, counts, waitUntil };
+  const lists = { learnNow, rev, news, learnToday: learnLater.filter(c => c.due < end) };
+  return { next, counts, waitUntil, lists };
 }
 
 function startStudy(scope) {
@@ -1821,13 +1827,213 @@ const tts = {
   },
   stop() { if (this.ok) speechSynthesis.cancel(); },
 };
-const spoken = fields => (fields || []).filter(f => f.l !== MEMO);
+/* ── 읽어 주기 설정 ── */
+const TTS_DEFAULT = { auto: 'off', rate: 1, gap: 3, skip: ['메모'], content: 'both', source: 'due', shuffle: false, repeat: true };
+let ttsCfg = { ...TTS_DEFAULT, ...store.get('tts', {}) };
+const saveTts = () => store.set('tts', ttsCfg);
+/** 카드에 쓰인 모든 컬럼 이름(읽지 않을 컬럼 고르기용) */
+function allLabels() {
+  const set = new Set();
+  for (const c of S.cards.values()) for (const f of [...c.front, ...c.back]) if (!f.img) set.add(f.l);
+  return [...set];
+}
+const spoken = fields => (fields || []).filter(f => !f.img && f.v && f.l !== MEMO && !ttsCfg.skip.includes(f.l));
+async function speakFields(fields, alive = () => true) {
+  for (const f of fields) {
+    await tts.speak(f.v, ttsCfg.rate);
+    if (!alive()) return false;
+  }
+  return true;
+}
 
 async function speakCurrent() {
   const c = study && study.card;
   if (!c) return;
   tts.stop();
-  for (const f of spoken(study.revealed ? c.back : c.front)) await tts.speak(f.v);
+  await speakFields(spoken(study.revealed ? c.back : c.front));
+}
+
+/* ── A. 자동 읽기: 카드가 나오거나 정답을 열면 읽어 준다(넘기는 건 직접) ── */
+let lastSpoke = '';
+function autoSpeak() {
+  if (ttsCfg.auto === 'off' || !tts.ok) return;
+  if (V.name !== 'study' || !study || !study.card || study.quiz) return;
+  const side = study.revealed ? 'back' : 'front';
+  if (side === 'back' && ttsCfg.auto !== 'both') return;
+  const key = `${study.card.id}:${side}`;
+  if (key === lastSpoke) return;
+  lastSpoke = key;
+  tts.stop();
+  speakFields(spoken(side === 'front' ? study.card.front : study.card.back));
+}
+
+function viewTts() {
+  const chip = (k, v, label, on) => `<button class="chip ${on ? 'on' : ''}" data-act="tts-set" data-k="${k}" data-v="${esc(String(v))}">${esc(label)}</button>`;
+  const labels = allLabels().filter(l => l !== MEMO);
+  return `${bar('🔊 읽어 주기')}
+  <main>
+    ${tts.ok ? '' : '<div class="panel"><p class="muted" style="margin:0">이 브라우저는 음성 읽기를 지원하지 않아요.</p></div>'}
+    <section class="panel">
+      <h3>자동 읽기</h3>
+      <p class="muted" style="margin:-6px 0 10px">학습 화면에서 넘기는 건 직접 하고, 내용만 읽어 줍니다.</p>
+      <div class="chips">
+        ${chip('auto', 'off', '끄기', ttsCfg.auto === 'off')}
+        ${chip('auto', 'front', '앞면만', ttsCfg.auto === 'front')}
+        ${chip('auto', 'both', '앞면 + 정답', ttsCfg.auto === 'both')}
+      </div>
+    </section>
+
+    <section class="panel">
+      <h3>속도</h3>
+      <div class="chips">${[0.8, 1, 1.2, 1.5].map(r => chip('rate', r, `${r}×`, ttsCfg.rate === r)).join('')}</div>
+      <button class="btn" data-act="tts-test">미리 들어 보기</button>
+    </section>
+
+    <section class="panel">
+      <h3>읽지 않을 컬럼</h3>
+      <p class="muted" style="margin:-6px 0 10px">길거나 듣기 어려운 컬럼은 빼 두세요. '메모'는 항상 제외됩니다.</p>
+      ${labels.length
+        ? `<div class="chips">${labels.map(l => chip('skip', l, l, ttsCfg.skip.includes(l))).join('')}</div>`
+        : '<p class="muted" style="margin:0">아직 카드가 없어요.</p>'}
+    </section>
+
+    <section class="panel">
+      <h3>듣기 모드</h3>
+      <p class="muted" style="margin:-6px 0 10px">앞면 → 정답 순서로 자동으로 넘기며 읽어 줍니다. 목차만 훑어 들을 수도 있어요.</p>
+      <button class="btn primary block" data-act="listen" data-scope="all">🎧 전체 듣기 시작</button>
+      <p class="muted" style="margin:10px 0 0">화면이 켜져 있는 동안만 읽어 줍니다. 복습 기록에는 반영되지 않아요.</p>
+    </section>
+  </main>`;
+}
+
+function setTts(k, v) {
+  if (k === 'skip') ttsCfg.skip = ttsCfg.skip.includes(v) ? ttsCfg.skip.filter(x => x !== v) : [...ttsCfg.skip, v];
+  else if (k === 'rate' || k === 'gap') ttsCfg[k] = Number(v);
+  else if (k === 'shuffle' || k === 'repeat') ttsCfg[k] = !ttsCfg[k];
+  else ttsCfg[k] = v;
+  saveTts();
+  lastSpoke = '';
+  if (k === 'source' || k === 'shuffle') reloadListen();
+  render();
+}
+
+/* ── B·C. 듣기 모드: 자동으로 넘기며 읽기(전체 / 목차만) ── */
+
+let listen = null, wakeLock = null;
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+async function requestWake() {
+  try { if (navigator.wakeLock) wakeLock = await navigator.wakeLock.request('screen'); } catch { /* 지원 안 함 */ }
+}
+function releaseWake() {
+  try { if (wakeLock) wakeLock.release(); } catch { /* 무시 */ }
+  wakeLock = null;
+}
+
+function listenIds(scope) {
+  if (ttsCfg.source === 'due') {
+    const l = buildQueue({ scope, revSinceNew: 0 }).lists;
+    const ids = [...l.learnNow, ...l.rev, ...l.news, ...l.learnToday].map(c => c.id);
+    if (ids.length) return ids;
+  }
+  const ids = new Set(scopeDecks(scope));
+  return [...S.cards.values()].filter(c => ids.has(c.deckId) && !c.suspended).sort((a, b) => a.order - b.order).map(c => c.id);
+}
+function startListen(scope) {
+  listen = { scope, ids: [], i: 0, playing: false, phase: 'front', token: 0 };
+  reloadListen();
+}
+function reloadListen() {
+  if (!listen) return;
+  listen.ids = listenIds(listen.scope);
+  if (ttsCfg.shuffle) shuffle(listen.ids);
+  listen.i = 0;
+  listen.phase = 'front';
+}
+function stopListen() {
+  if (!listen) return;
+  listen.playing = false;
+  listen.token++;
+  tts.stop();
+  releaseWake();
+  listen = null;
+}
+async function listenLoop() {
+  const L = listen, my = ++L.token;
+  const alive = () => listen === L && L.playing && L.token === my;
+  while (alive()) {
+    const c = S.cards.get(L.ids[L.i]);
+    if (c) {
+      L.phase = 'front';
+      render();
+      if (!await speakFields(spoken(c.front), alive)) return;
+      if (ttsCfg.content === 'both') {
+        await sleep(ttsCfg.gap * 1000);
+        if (!alive()) return;
+        L.phase = 'back';
+        render();
+        if (!await speakFields(spoken(c.back), alive)) return;
+      }
+      await sleep(Math.max(600, ttsCfg.gap * 500));
+      if (!alive()) return;
+    }
+    if (L.i + 1 < L.ids.length) L.i++;
+    else if (ttsCfg.repeat && L.ids.length) { L.i = 0; if (ttsCfg.shuffle) shuffle(L.ids); }
+    else { L.playing = false; L.phase = 'front'; releaseWake(); render(); return; }
+  }
+}
+function listenControl(act) {
+  const L = listen;
+  if (!L) return;
+  if (act === 'l-play') {
+    if (L.playing) { L.playing = false; L.token++; tts.stop(); releaseWake(); render(); }
+    else if (L.ids.length) { L.playing = true; requestWake(); listenLoop(); }
+    return;
+  }
+  if (act === 'l-prev' || act === 'l-next') {
+    if (!L.ids.length) return;
+    tts.stop();
+    L.token++;
+    L.i = (L.i + (act === 'l-next' ? 1 : -1) + L.ids.length) % L.ids.length;
+    L.phase = 'front';
+    if (L.playing) listenLoop(); else render();
+  }
+}
+
+function viewListen() {
+  if (!listen || listen.scope !== V.scope) startListen(V.scope);
+  const L = listen;
+  const head = bar(`🎧 ${scopeName(L.scope)}`, `<button class="icon-btn" data-act="tts" aria-label="읽어 주기 설정">⚙</button>`);
+  if (!tts.ok) return `${head}<main><div class="empty"><h2>음성 읽기를 지원하지 않는 브라우저예요</h2></div></main>`;
+  if (!L.ids.length) return `${head}<main><div class="empty"><div style="font-size:52px">🎧</div><h2>읽을 카드가 없어요</h2></div></main>`;
+  const c = S.cards.get(L.ids[L.i]);
+  const deck = c && S.decks.get(c.deckId);
+  const dom = deck && S.domains.get(S.categories.get(deck.catId)?.domainId);
+  const chip = (k, v, label, on) => `<button class="chip ${on ? 'on' : ''}" data-act="tts-set" data-k="${k}" data-v="${esc(String(v))}">${esc(label)}</button>`;
+  return `${head}
+  <main class="listen" style="--tab:${dom ? domColor(dom) : 'var(--accent)'}">
+    <div class="listen-card ${L.playing ? 'playing' : ''}">
+      ${deck ? `<div class="deck-tag">${esc(deck.name)}</div>` : ''}
+      <div class="inner">
+        <div class="front">${c ? fieldsHtml(spoken(c.front), deck, { fold: false }) : ''}</div>
+        ${L.phase === 'back' && c ? `<hr><div class="back">${fieldsHtml(spoken(c.back), deck, { fold: false })}</div>` : ''}
+      </div>
+      <div class="eq" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
+    </div>
+    <div class="listen-pos muted">${L.i + 1} / ${L.ids.length}</div>
+    <div class="listen-controls">
+      <button class="icon-btn big" data-act="l-prev" aria-label="이전">⏮</button>
+      <button class="play" data-act="l-play" aria-label="${L.playing ? '일시정지' : '재생'}">${L.playing ? '❚❚' : '▶'}</button>
+      <button class="icon-btn big" data-act="l-next" aria-label="다음">⏭</button>
+    </div>
+    <section class="panel listen-opts">
+      <div class="opt"><span>읽기</span><div class="chips">${chip('content', 'both', '앞면 + 정답', ttsCfg.content === 'both')}${chip('content', 'front', '목차(앞면만)', ttsCfg.content === 'front')}</div></div>
+      <div class="opt"><span>카드</span><div class="chips">${chip('source', 'due', '오늘 학습분', ttsCfg.source === 'due')}${chip('source', 'all', '전체', ttsCfg.source === 'all')}</div></div>
+      <div class="opt"><span>속도</span><div class="chips">${[0.8, 1, 1.2, 1.5].map(r => chip('rate', r, `${r}×`, ttsCfg.rate === r)).join('')}</div></div>
+      <div class="opt"><span>간격</span><div class="chips">${[2, 3, 5].map(g => chip('gap', g, `${g}초`, ttsCfg.gap === g)).join('')}</div></div>
+      <div class="opt"><span>옵션</span><div class="chips">${chip('shuffle', '', '순서 섞기', ttsCfg.shuffle)}${chip('repeat', '', '반복', ttsCfg.repeat)}</div></div>
+    </section>
+    <p class="muted listen-note">화면이 켜져 있는 동안 읽어 줘요. 복습 기록에는 반영되지 않습니다.</p>
+  </main>`;
 }
 
 /* ───────────────────────── 시험일 모드 설정 ───────────────────────── */
@@ -2372,6 +2578,7 @@ async function menuDomain(id) {
     { label: '이 대분류 전체 학습', value: 'study' },
     { label: '💪 약점 카드 연습', value: 'weak' },
     { label: '🎯 객관식 퀴즈', value: 'quiz' },
+    { label: '🎧 듣기 모드', value: 'listen' },
     { label: '이름 변경', value: 'rename' },
     { label: '색상 바꾸기', value: 'color' },
     { label: '삭제', value: 'delete', danger: true },
@@ -2379,6 +2586,7 @@ async function menuDomain(id) {
   if (a === 'add') return addCat(id);
   if (a === 'weak') { study = null; return go('study', { scope: WEAK + 'dom:' + id }); }
   if (a === 'quiz') { study = null; return go('study', { scope: QUIZ + 'dom:' + id }); }
+  if (a === 'listen') return go('listen', { scope: 'dom:' + id });
   if (a === 'color') {
     const r = await modal({
       title: '색상 바꾸기',
@@ -2411,6 +2619,7 @@ async function menuCat(id) {
     { label: '이 소분류 전체 학습', value: 'study' },
     { label: '💪 약점 카드 연습', value: 'weak' },
     { label: '🎯 객관식 퀴즈', value: 'quiz' },
+    { label: '🎧 듣기 모드', value: 'listen' },
     { label: '이름 변경', value: 'rename' },
     { label: '다른 대분류로 이동', value: 'move' },
     { label: '삭제', value: 'delete', danger: true },
@@ -2419,6 +2628,7 @@ async function menuCat(id) {
   if (a === 'study') return go('study', { scope: 'cat:' + id });
   if (a === 'weak') { study = null; return go('study', { scope: WEAK + 'cat:' + id }); }
   if (a === 'quiz') { study = null; return go('study', { scope: QUIZ + 'cat:' + id }); }
+  if (a === 'listen') return go('listen', { scope: 'cat:' + id });
   if (a === 'rename') {
     const name = await ui.prompt('소분류 이름 변경', c.name);
     if (name) { await commit({ categories: [{ ...c, name }] }); render(); }
@@ -2642,6 +2852,11 @@ document.addEventListener('click', async e => {
     }
     case 'search': return go('search');
     case 'stats': return go('stats');
+    case 'tts': return go('tts');
+    case 'tts-set': return setTts(el.dataset.k, el.dataset.v);
+    case 'tts-test': return speakFields([{ v: '읽어 주기 속도를 확인해 보세요.' }]);
+    case 'listen': return go('listen', { scope: el.dataset.scope });
+    case 'l-play': case 'l-prev': case 'l-next': return listenControl(act);
     case 'storage': storageInfo = null; return go('storage');
     case 'gc-media': return gcMedia();
     case 'persist': return askPersist();
@@ -2741,6 +2956,7 @@ document.addEventListener('keydown', e => {
 // 앱이 다시 보일 때 날짜가 바뀌었거나 학습 카드 시간이 됐을 수 있으니 갱신
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState !== 'visible') return;
+  if (listen && listen.playing) requestWake();
   if ($('.overlay')) return;
   if (V.name === 'study' && study && !study.card) pickNext();
   if (V.name !== 'import' && V.name !== 'browse') render();
